@@ -1,0 +1,59 @@
+<?xml version="1.0" ?>
+<!-- SPDX-License-Identifier: BUSL-1.1 -->
+<!--
+  evo kiosk labwc config.
+
+  Minimal config: server-side decorations off, F24 bound to HideCursor.
+  The session script fires F24 via wtype when the operator sets
+  cursor=hide (overlay file).
+
+  IMPORTANT: no windowRule for fullscreen. The kiosk browser requests
+  xdg_toplevel.set_maximized (see /usr/local/bin/evo-kiosk-browser).
+  Maximized keeps the client on the regular window layer so
+  wlr_layer_shell surfaces (squeekboard OSK on LAYER_TOP) render above
+  the kiosk. A ToggleFullscreen catch-all would force the client onto
+  the wlroots fullscreen layer which sits above LAYER_TOP and hid the
+  OSK. Removed.
+
+  Installed to /etc/evo/labwc/rc.xml by scripts/install/install.sh.
+  Consumed by labwc via its config-dir option pointing at /etc/evo/labwc,
+  invoked from /usr/local/bin/evo-kiosk-launch.
+
+  Do not edit /etc/evo/labwc/rc.xml in place; it is overwritten on every
+  install. Edit the source at layer/labwc/rc.xml in the repo.
+
+  Note: XML comments cannot contain a doubled hyphen sequence, so this
+  block avoids CLI flag syntax that would produce one. Use prose or the
+  single-letter short form when describing flags here.
+-->
+<labwc_config>
+
+  <core>
+    <!-- Client-side decorations: labwc draws nothing around client
+         windows. The kiosk browser draws no chrome of its own, so the
+         net effect is a clean, borderless surface. -->
+    <decoration>client</decoration>
+  </core>
+
+  <keyboard>
+    <!-- Keep the default labwc keybinds alongside ours. -->
+    <default />
+
+    <!-- F24 is a high function key not present on any real keyboard.
+         Safe to use as an IPC signal from the session script via wtype
+         without colliding with user input or application shortcuts. -->
+    <keybind key="F24">
+      <action name="HideCursor" />
+    </keybind>
+  </keyboard>
+
+  <!-- Touch device mapping. Empty deviceName matches every touchscreen,
+       so the DSI panel's Goodix chip is captured without hard-coding
+       the model. mapToOutput binds touch coordinates to DSI-1's output
+       space, which is required for wlroots to inverse-transform touch
+       events when the operator rotates the display. Without this, touch
+       events are reported in device-native panel coordinates regardless
+       of the current wlr-randr transform. -->
+  <touch deviceName="" mapToOutput="DSI-1" mouseEmulation="no" />
+
+</labwc_config>

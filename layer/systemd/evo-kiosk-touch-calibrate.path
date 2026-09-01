@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: BUSL-1.1
+#
+# Fires evo-kiosk-touch-calibrate.service whenever any file under
+# /var/lib/evo/settings/kiosk/ changes. The kiosk session (running
+# as an unprivileged user) writes the overlays; systemd runs the
+# apply-service as root. No sudo, no policykit, no in-session
+# helper daemon.
+#
+# WATCH TARGET IS THE DIRECTORY, NOT INDIVIDUAL FILES. A
+# `PathModified=<file>` directive arms an inotify watch on the
+# FILE INODE. `evo-kiosk-config::write_overlay_atomic` writes
+# to <path>.tmp and then `rename(2)`s over <path> — POSIX
+# unlinks the old inode. systemd's watch, still on the old
+# inode, receives IN_DELETE_SELF (not one of PathModified's
+# trigger events) and the new inode at the same path is
+# unwatched. Result: only the first atomic write after unit
+# start fires; every subsequent one is invisible. Verified on
+# .24 with an inotifywait probe.
+#
+# PathChanged on the parent DIRECTORY watches the dir's inode
+# with IN_CLOSE_WRITE | IN_MOVED_TO on child entries. The
+# MOVED_TO event that lands on the target filename during
+# rename-over IS caught. This is the same pattern the
+# session-side evo-kiosk-watch-settings uses for the OSK-theme
+# settings.json trigger — one lesson, applied everywhere it
+# matters.
+#
+# The paired .service is idempotent (compares the composed
+# LIBINPUT_CALIBRATION_MATRIX against the current udev rule
+# bytes and exits 0 without reload/unbind/bind when they
+# match), so directory-level firing on unrelated overlays
+# (brightness / sleep_* / calibrate_trigger) produces no
+# operator-visible artifact — no touch interruption.
+
+[Unit]
+Description=evo kiosk touch-calibration overlay watcher
+
+[Path]
+PathChanged=/var/lib/evo/settings/kiosk/
+Unit=evo-kiosk-touch-calibrate.service
+
+[Install]
+WantedBy=multi-user.target

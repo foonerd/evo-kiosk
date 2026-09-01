@@ -1,0 +1,230 @@
+#!/bin/sh
+# SPDX-License-Identifier: BUSL-1.1
+# evo-kiosk-launch - compositor launcher (system-level setup).
+#
+# Unit file sets TTYPath=/dev/tty1, Wayland env, RuntimeDirectory. Preflight
+# probes DRM and waits for /run/evo/kiosk.sock readiness.
+#
+# Resolves user settings (overlay files + kiosk.toml), exports wlroots
+# environment for the compositor, and execs labwc with the session script
+# as labwc's --session client. labwc -S <cmd> (not -s) runs <cmd> and
+# terminates the compositor when <cmd> exits - the kiosk lifecycle is
+# driven by systemd which restarts the whole unit on exit.
+#
+# Stack: labwc (wlroots compositor with layer-shell) +
+# /usr/local/bin/evo-kiosk-browser (GTK4 + webkit2gtk). See docs/KIOSK.md.
+#
+# The OSK is NOT started here. It is a Wayland client and needs the
+# compositor's Wayland socket, which exists only after labwc has started.
+# OSK startup lives in evo-kiosk-session.
+#
+# Runtime config (overlays win over TOML):
+#   - /etc/evo/kiosk.toml
+#   - /var/lib/evo/settings/kiosk/*
+
+set -eu
+
+KIOSK_URL="${KIOSK_URL:-http://127.0.0.1/}"
+KIOSK_TOML="${KIOSK_TOML:-/etc/evo/kiosk.toml}"
+KIOSK_SETTINGS_DIR="${KIOSK_SETTINGS_DIR:-/var/lib/evo/settings/kiosk}"
+KIOSK_OUTPUT="${KIOSK_OUTPUT:-}"
+SESSION_BIN="/usr/local/bin/evo-kiosk-session"
+LABWC_CONFIG_DIR="/etc/evo/labwc"
+
+log() {
+  printf '[kiosk-launch] %s\n' "$*"
+}
+
+# ------------------------------ TOML read ------------------------------
+
+# Minimal TOML accessor using python3 tomllib if available, else a sed-based
+# flat-key reader. Supports only top-level string/bool scalars we need.
+toml_get() {
+  key="$1"
+  default="$2"
+  if [ ! -r "${KIOSK_TOML}" ]; then
+    printf '%s' "${default}"
+    return
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "${KIOSK_TOML}" "${key}" "${default}" <<'PY' 2>/dev/null || printf '%s' "${default}"
+import sys
+try:
+    import tomllib
+except Exception:
+    sys.exit(1)
+path, key, default = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+except Exception:
+    print(default, end="")
+    sys.exit(0)
+val = data.get(key, default)
+if isinstance(val, bool):
+    print("true" if val else "false", end="")
+else:
+    print(str(val), end="")
+PY
+    return
+  fi
+  # Fallback parser (flat keys only, no sections).
+  awk -v k="${key}" -v d="${default}" '
+    /^[[:space:]]*#/ { next }
+    /^\[/ { next }
+    {
+      line=$0
+      sub(/#.*$/, "", line)
+      n=index(line, "=")
+      if (n == 0) next
+      lhs=substr(line,1,n-1); rhs=substr(line,n+1)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", lhs)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", rhs)
+      gsub(/^"/, "", rhs); gsub(/"$/, "", rhs)
+      gsub(/^'\''/, "", rhs); gsub(/'\''$/, "", rhs)
+      if (lhs == k) { print rhs; exit }
+    }
+    END { if (!found) print d }
+  ' "${KIOSK_TOML}"
+}
+
+# Overlay wins over TOML. Empty overlay -> TOML -> hard default.
+resolve() {
+  key_overlay="$1"
+  key_toml="$2"
+  default="$3"
+  f="${KIOSK_SETTINGS_DIR}/${key_overlay}"
+  if [ -r "${f}" ]; then
+    v=$(head -1 "${f}" | tr -d '\r\n' || true)
+    if [ -n "${v}" ]; then
+      printf '%s' "${v}"
+      return
+    fi
+  fi
+  v=$(toml_get "${key_toml}" "${default}")
+  printf '%s' "${v}"
+}
+
+OSK=$(resolve osk osk squeekboard)
+CURSOR=$(resolve cursor cursor auto)
+OSK_FORCE_SHOW=$(resolve osk_force_show osk_force_show false)
+AUTO_ROTATE=$(resolve auto_rotate auto_rotate false)
+XKB_LAYOUT=$(resolve xkb_layout xkb_layout us)
+# Legacy single-axis rotation: mirrors both display and touch when
+# neither of the decoupled overlays is present. New deployments
+# should set display_rotation + touch_rotation directly.
+ROT_RAW=$(resolve rotation rotation 0)
+DISPLAY_ROT_RAW=$(resolve display_rotation display_rotation "${ROT_RAW}")
+TOUCH_ROT_RAW=$(resolve touch_rotation touch_rotation "${ROT_RAW}")
+TOUCH_HFLIP=$(resolve touch_hflip touch_hflip false)
+TOUCH_VFLIP=$(resolve touch_vflip touch_vflip false)
+# WebKit page zoom for the kiosk browser. The Rust binary reads KIOSK_ZOOM
+# and calls set_zoom_level().
+KIOSK_ZOOM=$(resolve zoom zoom 1.2)
+# Wayland output scale. "auto" means do not call wlr-randr at all.
+KIOSK_SCALE=$(resolve scale scale auto)
+# Resolved XKB layout for squeekboard.
+KIOSK_OSK_LAYOUT=$(resolve osk_layout osk_layout us)
+
+# Display rotation: overlay > TOML > 0. Variable name WLR_ROT matches
+# the consumer — wlroots env vars read by labwc.
+case "${DISPLAY_ROT_RAW}" in
+  0|normal) WLR_ROT=normal ;;
+  90)       WLR_ROT=90 ;;
+  180)      WLR_ROT=180 ;;
+  270)      WLR_ROT=270 ;;
+  *)        WLR_ROT=normal ;;
+esac
+
+# Normalise touch rotation: "normal" is an alias for 0 same way the
+# display side handles it.
+case "${TOUCH_ROT_RAW}" in
+  0|normal) TOUCH_ROT=0 ;;
+  90)       TOUCH_ROT=90 ;;
+  180)      TOUCH_ROT=180 ;;
+  270)      TOUCH_ROT=270 ;;
+  *)        TOUCH_ROT=0 ;;
+esac
+case "${TOUCH_HFLIP}" in
+  true|1|yes) TOUCH_HFLIP=true ;;
+  *)          TOUCH_HFLIP=false ;;
+esac
+case "${TOUCH_VFLIP}" in
+  true|1|yes) TOUCH_VFLIP=true ;;
+  *)          TOUCH_VFLIP=false ;;
+esac
+
+# Touch calibration is owned by evo-kiosk-touch-calibrate.service +
+# .path. The .service is pulled in by evo-kiosk.service's Wants= so
+# it runs at boot before the compositor starts; the .path fires the
+# same .service on any overlay write while the session is live.
+# This launch script only exports the resolved touch config to the
+# session for logging + observability — the actual apply happens
+# from systemd (as root, no sudo needed under NoNewPrivileges).
+
+# URL override via TOML.
+URL_FROM_TOML=$(toml_get url "${KIOSK_URL}")
+if [ -n "${URL_FROM_TOML}" ]; then
+  KIOSK_URL="${URL_FROM_TOML}"
+fi
+
+log "url=${KIOSK_URL} output=${KIOSK_OUTPUT:-<first>} display_rot=${WLR_ROT} touch_rot=${TOUCH_ROT} touch_hflip=${TOUCH_HFLIP} touch_vflip=${TOUCH_VFLIP} osk=${OSK} cursor=${CURSOR} auto_rotate=${AUTO_ROTATE} zoom=${KIOSK_ZOOM} scale=${KIOSK_SCALE} osk_layout=${KIOSK_OSK_LAYOUT}"
+
+# ---------------------------- Compositor environment ----------------------
+
+export WLR_XKB_LAYOUT="${XKB_LAYOUT}"
+
+if [ "${WLR_ROT}" != "normal" ]; then
+  if [ -n "${KIOSK_OUTPUT}" ]; then
+    # Preferred form: per-output transform. wlroots key format:
+    #   WLR_OUTPUT_<NAME_WITH_DASHES_REPLACED_BY_UNDERSCORES>_TRANSFORM
+    canon=$(printf '%s' "${KIOSK_OUTPUT}" | tr '-' '_')
+    varname="WLR_OUTPUT_${canon}_TRANSFORM"
+    # POSIX sh has no `export "${var}=val"`. Use env.
+    export "${varname}=${WLR_ROT}" 2>/dev/null || eval "export ${varname}=${WLR_ROT}"
+  else
+    export WLR_RENDER_NO_EXPLICIT_SYNC=1 2>/dev/null || true
+    export WLR_OUTPUT_TRANSFORM="${WLR_ROT}"
+  fi
+fi
+
+if [ -n "${KIOSK_OUTPUT}" ]; then
+  export WLR_OUTPUTS="${KIOSK_OUTPUT}"
+fi
+
+# Pass resolved settings through to the session script. labwc inherits the
+# parent environment for its session command.
+export KIOSK_URL
+export OSK
+export OSK_FORCE_SHOW
+export KIOSK_CURSOR="${CURSOR}"
+export KIOSK_ZOOM
+export KIOSK_SCALE
+export KIOSK_OSK_LAYOUT
+# Session applies rotation via wlr-randr together with scale (single call).
+# If scale runs alone, wlroots resets output transform.
+export KIOSK_ROT="${WLR_ROT}"
+
+if [ ! -x "${SESSION_BIN}" ]; then
+  log "ERROR: session helper missing at ${SESSION_BIN}"
+  exit 1
+fi
+
+if [ ! -r "${LABWC_CONFIG_DIR}/rc.xml" ]; then
+  log "ERROR: labwc config missing at ${LABWC_CONFIG_DIR}/rc.xml"
+  exit 1
+fi
+
+# labwc-config(5) has no <idle> element on 0.9.8; sleep is driven
+# by a session-side swayidle child (see evo-kiosk-watch-settings),
+# so labwc always reads the static /etc/evo/labwc/rc.xml — no
+# runtime overlay dir any more.
+# Seamless-handoff Phase 2 note: the Plymouth deactivate/quit is NOT done
+# here. This script runs as the unprivileged kiosk user (User= in the unit
+# drop-in), and plymouth control commands require root. The handoff is done
+# from the root context by evo-kiosk-plymouth-handoff, invoked from the unit
+# with systemd's '+' prefix (ExecStartPre deactivate before this exec,
+# ExecStartPost quit after labwc has the display). See evo-kiosk.service.
+
+log "[handoff] labwc exec --config-dir ${LABWC_CONFIG_DIR} --session ${SESSION_BIN}"
+exec labwc --config-dir "${LABWC_CONFIG_DIR}" --session "${SESSION_BIN}"

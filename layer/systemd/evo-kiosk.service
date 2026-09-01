@@ -1,0 +1,191 @@
+# SPDX-License-Identifier: BUSL-1.1
+# evo kiosk session.
+#
+# User= is NOT hardcoded here. Distributions install a drop-in, e.g.
+#   /etc/systemd/system/evo-kiosk.service.d/10-user.conf
+# with User= / Group= / Environment=HOME= for the service account that
+# also holds EVO_KIOSK_UIDS mint eligibility. This repo's install.sh
+# deploys the unit body only.
+#
+# Default-on when non-headless: ConditionPathExistsGlob=/dev/dri/card*
+# gates activation; WantedBy=multi-user.target is the default install
+# enablement target. Headless hosts (no DRM) install files but do not
+# enable. Operator Settings toggle can disable/re-enable.
+#
+# TTYPath is static (/dev/tty1). Do not try to discover VT in ExecStartPre
+# and hand it via EnvironmentFile: systemd reads EnvironmentFile before
+# ExecStartPre runs.
+#
+# Browser: GTK4 + webkit2gtk at /usr/local/bin/evo-kiosk-browser.
+# Mint ownership: browser process only, against /run/evo/kiosk.sock.
+# Preflight checks socket readiness; never mints or logs tokens.
+#
+# WebKit sandbox: disabled under PAM-login systemd context.
+#
+# Reproduced on-target 2026-08-03 (Debian Trixie 13,
+# libwebkitgtk-6.0-4 2.52.5-1~deb13u1, systemd 257.9-1~deb13u1,
+# kernel 6.12.75+rpt-rpi-2712, Pi 5 aarch64) with the disable
+# env removed via drop-in `UnsetEnvironment=`. Failure chain,
+# verbatim from the journal:
+#
+#   bwrap: Unexpected capabilities but not setuid, old file caps config?
+#   evo-kiosk-brows: Failed to fully launch dbus-proxy: Child process exited with code 1
+#   labwc: spawned child terminated with signal 5 (Trace/breakpoint trap)
+#
+# Same chain first documented at volumio-evo@ecbffb9 /
+# volumio-evo@8cec7fe. Sandbox reinstate is genuinely upstream-
+# blocked on the bwrap-under-PAM-login capabilities handshake.
+# The systemd-primitive sandbox directives below reduce blast
+# radius on any RCE against WebKit or a bundled media parser,
+# independent of the WebKit sandbox state.
+#
+# The kiosk loads local loopback UI only and the nav-policy
+# allowlist pins the WebView to the initial URL's origin plus
+# `about:blank` (data: URIs refused, other about:* refused);
+# see crates/kiosk-browser/src/nav_policy.rs.
+#
+# Do not remove the disable env without either an upstream
+# resolution to the bwrap-under-PAM handshake, or replacing
+# webkit's own sandbox with an equivalent (unshare + landlock +
+# seccomp) implemented as a systemd wrapper.
+
+[Unit]
+Description=evo kiosk session
+Documentation=https://github.com/foonerd/evo-kiosk-eng
+# Order after the loopback UI runtime it loads (evo-ui.service) and the
+# input/calibration oneshots, NOT on network-online.target (that pulled in
+# NetworkManager-wait-online ~8.5s). Starting labwc *before* evo-ui was a
+# compositor-first experiment (Phase 1) that started the compositor into a
+# busier part of boot and exposed an intermittent libinput/seat race on the
+# Pi 5 DSI touchscreen (touch sometimes not acquired). Reverted: labwc waits
+# for evo-ui + the touch-calibrate/apply oneshots, so input is settled when
+# the seat comes up. The splash->compositor gap is covered by the Plymouth
+# handoff (deactivate keeps the splash on the FB until labwc takes over), so
+# a later labwc start costs a longer animated splash, not a black frame.
+After=systemd-user-sessions.service plymouth-start.service plymouth-quit.service evo-ui.service evo-kiosk-touch-calibrate.service evo-kiosk-apply-settings.service
+Wants=evo-ui.service evo-kiosk-touch-calibrate.service evo-kiosk-apply-settings.service
+# Seamless-handoff Phase 2: the kiosk is the display manager for Plymouth's
+# purposes and OWNS the quit, the mainstream DM shape (GDM/SDDM). Conflicts=
+# plymouth-quit.service so the free-running quit does not fire and tear the
+# splash down to a blank console before the compositor is up; instead
+# evo-kiosk-launch calls `plymouth deactivate` before exec labwc (splash
+# stays on the framebuffer, DRM master dropped) and evo-kiosk-session calls
+# `plymouth quit --retain-splash` after labwc's first output is up. NEVER
+# ship this Conflicts without those two calls in launch/session - half-shipped
+# leaves Plymouth stuck (documented GDM failure mode); OnFailure below is the
+# covered path if labwc dies before the quit. Also conflicts getty@tty1 so no
+# login prompt claims tty1 in the gap.
+Conflicts=getty@tty1.service plymouth-quit.service
+OnFailure=plymouth-quit.service
+ConditionPathExistsGlob=/dev/dri/card*
+
+[Service]
+Type=simple
+PAMName=login
+# Static VT assignment. tty1 is the first console VT on every Linux system
+# and the slot used by graphical sessions on minimal Debian targets.
+TTYPath=/dev/tty1
+StandardInput=tty
+StandardOutput=journal
+StandardError=journal
+# Seamless splash handoff: do NOT let systemd wipe tty1's framebuffer when
+# the unit starts. plymouth-quit --retain-splash leaves the last splash
+# frame in the framebuffer and drops DRM master; the retained image must
+# survive until labwc takes DRM master and paints over it (a dissolve, no
+# black frame). TTYReset (terminal reset) and TTYVTDisallocate (VT
+# deallocation) both re-initialise tty1's console and clear that retained
+# frame - and because the mint-socket wait lives in ExecStartPre, this unit
+# does not reach its main start until ~4s after plymouth-quit, making the
+# wipe a very visible flash-to-blank right before the compositor paints.
+# labwc/wlroots acquires the VT via libseat and does its own KMS modeset; it
+# does not need the VT reset or deallocated. Leave these off so the splash
+# holds across the handoff. TTYVHangup stays on (SIGHUP any stray holder of
+# tty1; it does not touch the framebuffer). getty is kept off tty1 by
+# Conflicts=getty@tty1.service above.
+TTYReset=no
+TTYVHangup=yes
+TTYVTDisallocate=no
+# Managed by systemd: creates /run/evo-kiosk at unit start owned by User=
+# from the distribution drop-in, cleans up at unit stop.
+RuntimeDirectory=evo-kiosk
+Environment=XDG_SESSION_TYPE=wayland
+Environment=GDK_BACKEND=wayland
+Environment=WLR_LIBINPUT_NO_DEVICES=0
+# webkit2gtk bubblewrap sandbox fails under PAM-login on minimal images.
+# Local UI only; leave disabled until a validated re-enable path exists.
+Environment=WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1
+ExecStartPre=/usr/local/bin/evo-kiosk-preflight
+# Seamless-handoff Phase 2 (root context via '+'). Plymouth control needs
+# root; ExecStart runs as the unprivileged kiosk user, so the handoff runs
+# here. deactivate immediately before labwc keeps the splash on the FB while
+# the compositor takes DRM master; quit (detached, after a short settle)
+# releases plymouthd once labwc owns the panel. Both best-effort.
+ExecStartPre=+/usr/local/bin/evo-kiosk-plymouth-handoff deactivate
+ExecStart=/usr/local/bin/evo-kiosk-launch
+ExecStartPost=+/bin/sh -c '/usr/local/bin/evo-kiosk-plymouth-handoff quit 2 </dev/null >/dev/null 2>&1 &'
+# Shutdown-direction handoff (root): as the kiosk exits during a real
+# reboot/poweroff, bring the splash back up so the panel does not flash the
+# console for ~1.5s before plymouth-reboot.service. Gated inside the helper
+# to fire only when the system is stopping (never on a mid-session restart)
+# and timeout-bounded; TimeoutStopSec caps the whole stop so it can never
+# wedge shutdown.
+ExecStop=+/usr/local/bin/evo-kiosk-plymouth-handoff shutdown
+TimeoutStopSec=10
+Restart=always
+RestartSec=2
+
+# ---------------------------------------------------------------
+# Hardening — defense-in-depth for the sandbox-off compromise
+#
+# The WebKit bwrap sandbox is disabled under PAM-login on current
+# Debian Trixie (bwrap fails caps-vs-setuid check → xdg-dbus-proxy
+# exit 1 → WebProcess SIGTRAP → labwc bails; reproduced on
+# libwebkitgtk-6.0-4 2.52.5 / systemd 257 / kernel 6.12.75 on
+# 2026-08-03). Sandbox reinstate is genuinely upstream-blocked.
+#
+# These systemd sandbox primitives reduce blast radius on any
+# RCE against WebKit or a bundled media parser, independent of
+# the WebKit sandbox state. Each was verified on-target: the
+# kiosk unit starts and stays running with all of them applied.
+#
+# Not applied (documented reason):
+#  - MemoryDenyWriteExecute=yes — incompatible with the JS JIT
+#    (WebKit maps writable-then-executable pages for JIT'd code)
+#  - PrivateDevices=yes — mounts a curated /dev subset that does
+#    NOT include /dev/dri; the kiosk needs DRM for the compositor
+#  - PrivateNetwork=yes — kills the loopback HTTP the kiosk loads
+#  - RestrictNamespaces=yes — held pending sandbox-reinstate work
+#    (bwrap creates namespaces; leaving room for that path back)
+NoNewPrivileges=yes
+PrivateTmp=yes
+# ProtectHome deliberately NOT set here — labwc + webkit + GTK
+# write config, cache, cookies, local-storage under $HOME. A
+# distribution can add `ProtectHome=tmpfs` plus a
+# `BindPaths=/home/<service-user>` in its drop-in if it wants
+# a stronger blanket, but that's a per-distribution decision
+# (needs the service user name that only the drop-in knows).
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+# ProtectSystem=strict makes /usr /boot /efi read-only and /etc
+# read-only, then only the ReadWritePaths= list is writable.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/evo/settings/kiosk /var/lib/evo/ui /run/evo
+# Address family allowlist. kiosk speaks:
+#  - AF_UNIX for the mint socket + wayland + dbus
+#  - AF_INET / AF_INET6 for the loopback HTTP URL
+#  - AF_NETLINK for udev change events (input hotplug, output
+#    hotplug) — labwc + gstreamer + squeekboard consume these
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

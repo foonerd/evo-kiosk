@@ -1,0 +1,25 @@
+[package]
+name = "evo-kiosk-config"
+version = "0.1.13"
+# Explicit values (not workspace-inherited) because this crate is
+# consumed as a path dep from evo-device-audio's cross-build via
+# cross-rs; cross-rs auto-mounts the crate dir but not the
+# owning workspace root, so `edition.workspace = true` would fail
+# to resolve inside the build container. Same reason
+# evo-plugin-sdk uses explicit values.
+edition = "2021"
+license = "BUSL-1.1"
+description = "Kiosk operator-settings write path (overlay atomic writes + calibration wizard math). Shared by evo-kiosk-browser (local WebKit handlers) and the org.evoframework.system.kiosk plugin (remote WS verbs) so both write identical bytes to the same overlay files."
+
+# Pure Rust, no OS-graphical deps. Host CI + on-target both compile
+# with the default feature set.
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+# serde_json is used only to lock the `DisplayState` wire shape
+# in a unit test; not compiled into the shipped crate. Fixture-
+# free — no filesystem or network needed for any test.
+serde_json = "1"

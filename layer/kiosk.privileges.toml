@@ -1,0 +1,248 @@
+# evo-kiosk — component privileges + host provisioning source of truth
+#
+# Same discipline the evo framework enforces on OOP plugin bundles
+# (`privileges.yaml` per plugin): a single machine-readable file that
+# declares every OS dependency, verified both at install time (packages
+# are pulled) AND at runtime (preflight refuses to start the unit if a
+# required binary or service is missing).
+#
+# Kiosk is not a framework plugin. It is a systemd-managed session
+# service that talks to `/run/evo/kiosk.sock` only. Because the framework's
+# plugin admission engine does not consume this file, the on-disk format
+# is TOML (Python stdlib `tomllib`) rather than the framework's YAML —
+# every consumer of this file (install.sh, preflight, release scripts)
+# is a shell/Python surface, so a stdlib-parseable format keeps the
+# reader path zero-dependency.
+#
+# WHY the discipline:
+# - Without a runtime enforcement gate, a device where `labwc` was
+#   uninstalled after install fails at ExecStart with a systemd error
+#   message and no operator hint. Preflight catches it before the
+#   compositor is spawned, names the missing binary, and refuses.
+# - Without a single source of truth, the install-side apt list and
+#   the runtime enforcement list drift. First-install works, apt
+#   trims a "orphan" package a year later, runtime fails, nobody
+#   remembers why the install list carried it.
+#
+# Consumers:
+# - `scripts/install/install.sh`   reads `host_provisioning.debian.*`
+#                                  and installs those packages.
+# - `layer/bin/evo-kiosk-preflight` reads `required_binaries` +
+#                                  `required_system_services` and
+#                                  refuses to start the unit if any
+#                                  required entry is absent.
+# - `scripts/release/pre-tag-check.sh` reads the whole file at cut
+#                                  time and refuses to promote if the
+#                                  installer's apt list drifts from
+#                                  the declared dependencies.
+
+schema_version = "1.0"
+component = "org.evoframework.kiosk"
+owner = "kiosk-workspace"
+isolation = "systemd-service"
+
+# Kiosk carries hard OS dependencies: labwc + GTK4 + webkit2gtk +
+# wlroots utilities + an on-screen keyboard family. Installer + runtime
+# preflight both refuse to proceed when any `required` entry is absent.
+has_os_dependencies = true
+
+# ------------------------------- capability intent -------------------
+# WHY each dependency exists, in operator terms. Read this to
+# understand why a specific binary is on the required list.
+
+[[capability_intent]]
+id = "wayland_compositor"
+need = "run the on-device Wayland compositor session (labwc) that hosts the kiosk browser and OSK on the reference display"
+access_path = "display/wayland"
+failure_mode = "kiosk unit fails at ExecStart; systemd retries; operator sees `labwc: not found` in the journal"
+
+[[capability_intent]]
+id = "gtk4_webkit_browser"
+need = "render the local UI SPA (loopback URL) via GTK4 + webkit2gtk 6 in the kiosk browser binary"
+access_path = "display/webkit"
+failure_mode = "browser fails to launch; kiosk UI is unavailable; systemd restarts unit indefinitely"
+
+[[capability_intent]]
+id = "on_screen_keyboard"
+need = "expose an on-screen keyboard for touch / kiosk seats via the Wayland layer-shell protocol"
+access_path = "display/wayland-layer-shell"
+failure_mode = "OSK unavailable; touch operator cannot type; kiosk still launches"
+
+[[capability_intent]]
+id = "output_layout"
+need = "apply scale + rotation via wlr-randr for operator-configured display orientation and DPI"
+access_path = "display/wlroots"
+failure_mode = "scale + rotation ignored; falls back to compositor defaults; kiosk still launches"
+
+[[capability_intent]]
+id = "output_power_management"
+need = "drive DPMS-equivalent screen power-off on operator-configured idle timeout (labwc 0.9.8 has no <idle> config element and delegates to an external idle-notify client — see labwc-config(5))"
+access_path = "display/wlr-output-power-management-v1"
+failure_mode = "idle timeout never enforced; screen stays on indefinitely regardless of sleep_timeout_seconds setting"
+
+[[capability_intent]]
+id = "config_reader"
+need = "read /etc/evo/kiosk.toml operator config with a full TOML parser (Python `tomllib`)"
+access_path = "filesystem/config"
+failure_mode = "installer + preflight fall back to a lossy flat-key awk parser; sections + arrays in operator config are silently dropped"
+
+# ------------------------------- required at runtime -----------------
+# Every entry in `required_binaries` MUST resolve on PATH at preflight;
+# every entry in `required_system_services` MUST be `active` at
+# preflight. Missing entry -> unit refuses to start with a named
+# operator message.
+
+[[required_binaries]]
+name = "labwc"
+failure_mode = "kiosk unit fails at ExecStart; operator sees `labwc: not found` in journal; no compositor spawned"
+
+[[required_binaries]]
+name = "wlr-randr"
+failure_mode = "scale + rotation overlays ignored at session start; kiosk falls back to compositor defaults"
+
+[[required_binaries]]
+name = "wtype"
+failure_mode = "HideCursor keybind (F24) not delivered; cursor stays visible when `cursor=hide` is set"
+
+[[required_binaries]]
+name = "gsettings"
+failure_mode = "OSK XKB layout apply skipped; falls back to compositor default layout"
+
+[[required_binaries]]
+name = "busctl"
+failure_mode = "OSK force-visible (debug) skipped; not on operator hot path"
+
+[[required_binaries]]
+name = "python3"
+failure_mode = "kiosk.toml operator config parser falls back to a lossy flat-key awk reader; sections and arrays silently dropped"
+
+# On-screen keyboard family — at least one must be present. The
+# session script picks between them at runtime via the `osk=` overlay;
+# both are declared here so an operator switching `osk=` at runtime
+# does not hit an unexpected "not installed" failure.
+
+[[required_binaries]]
+name = "squeekboard"
+failure_mode = "OSK unavailable when `osk=squeekboard` (the default); session falls through to no-OSK path"
+
+[[required_binaries]]
+name = "wvkbd-mobintl"
+failure_mode = "OSK unavailable when `osk=wvkbd`; session falls through to no-OSK path"
+
+[[required_binaries]]
+name = "inotifywait"
+failure_mode = "live rotation watcher falls back to a 1s mtime-poll loop; UI rotation still applies but with up to 1s lag instead of ~300ms debounced"
+
+[[required_binaries]]
+name = "udevadm"
+failure_mode = "touch calibration matrix cannot be pushed to libinput at boot; touch coordinates stuck on kernel default until the next full reboot"
+
+[[required_binaries]]
+name = "awk"
+failure_mode = "session-side output detection in evo-kiosk-session + evo-kiosk-watch-settings cannot parse wlr-randr output; display rotation live-apply falls back to whatever was set at compositor start"
+
+[[required_binaries]]
+name = "swayidle"
+failure_mode = "operator-configured sleep timeout never enforced (labwc 0.9.8 has no <idle> config element per labwc-config(5); an external idle-notify client is required); screen stays on indefinitely"
+
+[[required_binaries]]
+name = "wlopm"
+failure_mode = "swayidle timeout fires but no output-power action executes; screen stays on indefinitely on idle"
+
+required_kernel_modules = []
+
+[[required_system_services]]
+name = "evo.service"
+failure_mode = "mint socket /run/evo/kiosk.sock never appears; preflight times out after EVO_KIOSK_SOCK_WAIT_SECS; unit refuses to start until the framework steward is up"
+
+[[required_system_services]]
+name = "systemd-user-sessions.service"
+failure_mode = "PAM login for the kiosk unit refused; systemd retries indefinitely"
+
+# ------------------------------- runtime verification ----------------
+# Preflight runs these commands (in order) and refuses to start the
+# unit if any exit non-zero. Every command MUST be observation-only —
+# no state mutation.
+
+[verification]
+commands = [
+  "command -v labwc",
+  "command -v wlr-randr",
+  "test -d /run/evo",
+]
+expected = [
+  "labwc discoverable on PATH",
+  "wlr-randr discoverable on PATH",
+  "/run/evo runtime dir exists (steward RuntimeDirectory)",
+]
+
+# ------------------------------- host provisioning -------------------
+# Per-distribution package lists. `install.sh` reads this section
+# for its apt install list; there is no embedded package list in
+# `install.sh` itself. The installer refuses to proceed if the
+# distribution family is not represented here.
+
+[host_provisioning.debian.apt_packages]
+# Runtime packages — required for the unit to run at all. Installer
+# refuses if any of these are missing from the apt index at install
+# time.
+required = [
+  "labwc",
+  "wlr-randr",
+  # Idle-notify client + wlr-output-power-management-v1 driver.
+  # labwc 0.9.8 has no <idle> config element (labwc-config(5)
+  # delegates idle/powersave to an external client); this pair
+  # is what actually enforces sleep_timeout_seconds.
+  "swayidle",
+  "wlopm",
+  "libgtk-4-1",
+  "libglib2.0-bin",
+  "libsoup-3.0-0",
+  "bubblewrap",
+  "xdg-dbus-proxy",
+  "squeekboard",
+  "wvkbd",
+  "wtype",
+  "xkb-data",
+  "fonts-dejavu-core",
+  "libinput-tools",
+  # Live-rotation watcher primary path — inotifywait ships in
+  # inotify-tools. Fallback poll loop makes this soft-required, but
+  # every real deployment should have it for snappy UI response.
+  "inotify-tools",
+  # udevadm is used to reload rules + re-trigger input devices when
+  # touch calibration changes; ships in systemd/udev metapackage but
+  # declared explicitly so preflight surfaces the absent tool on a
+  # stripped-down base image.
+  "udev",
+  "gstreamer1.0-plugins-base",
+  "gstreamer1.0-plugins-good",
+  "gstreamer1.0-libav",
+  "python3",
+  # Install-time only. The signed-fetch mode of install.sh
+  # (KIOSK_BROWSER_SOURCE=signed, the default) clones the
+  # release plane over git and verifies channel + binary
+  # signatures via openssl before placing the binary. Neither
+  # tool is called from the runtime path — preflight does not
+  # re-verify at unit start today. Kept in the runtime install
+  # set so a later runtime-integrity check does not need a
+  # bootstrap step.
+  "git",
+  "openssl",
+]
+# WebKitGTK 6 lands under one of two package names depending on the
+# Debian version. Installer selects the first that resolves in the
+# apt index.
+required_alternatives = [
+  ["libwebkitgtk-6.0-4", "libwebkitgtk-6.0-1"],
+]
+# Optional at runtime; installer skips silently if absent.
+optional = []
+# Only pulled when the installer is going to cargo-build the browser
+# from source (no prebuilt available for the target arch).
+build_only = [
+  "libgtk-4-dev",
+  "libwebkitgtk-6.0-dev",
+  "libsoup-3.0-dev",
+  "pkg-config",
+]

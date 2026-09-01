@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: BUSL-1.1
+# Applies operator kiosk settings that need root: brightness only
+# today (backlight sysfs write). Sleep-related overlays are
+# handled on the session side by evo-kiosk-watch-settings which
+# manages a swayidle child bound to the labwc Wayland session
+# (labwc 0.9.8 has no <idle> config element — see the
+# evo-kiosk-watch-settings source for details). Fired at boot
+# (via evo-kiosk.service Wants=) and on every settings/kiosk/
+# overlay write (via the paired .path unit which watches the
+# whole directory).
+#
+# Runs as root because it writes /sys/class/backlight/*/brightness.
+# The kiosk.service itself runs as the compositor user with
+# NoNewPrivileges=yes; a sudo path from there would be blocked.
+# systemd owning this unit sidesteps the conflict.
+
+[Unit]
+Description=evo kiosk operator settings apply (brightness)
+Documentation=https://github.com/foonerd/evo-kiosk-eng
+After=systemd-udevd.service
+# Runs before the kiosk unit at boot so the initial brightness
+# apply lands before labwc starts. Also fires on-demand from
+# the .path unit while the kiosk is running.
+Before=evo-kiosk.service
+# Disable systemd's start-rate limit. The paired .path unit
+# watches the whole settings/kiosk/ directory (see the .path
+# file for why file-inode watches were unusable), so this
+# service is legitimately triggered on every overlay write —
+# touch_*, brightness, sleep_*, calibrate_trigger, etc. An
+# operator opening a UI settings pane that dirties multiple
+# overlays can easily produce more than the systemd default
+# StartLimitBurst=5 within StartLimitIntervalSec=10s and lock
+# the service out. The service is idempotent (reads the current
+# sysfs backlight value and skips the write when it already
+# matches the intended raw), bounded (TimeoutStartSec below),
+# and not a crash loop, so the start limit's protection is
+# unnecessary here and would just cause dropped applies. See
+# systemd.unit(5) — "0 disables the rate limiting."
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+ExecStart=/usr/local/sbin/evo-kiosk-apply-settings
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=15s
+
+[Install]
+WantedBy=multi-user.target

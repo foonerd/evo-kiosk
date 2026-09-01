@@ -1,0 +1,58 @@
+[package]
+name = "evo-kiosk-browser"
+version = "0.1.13"
+edition.workspace = true
+license.workspace = true
+description = "evo on-device WebKit kiosk shell (GTK 4 + webkit2gtk 6)"
+
+[lib]
+name = "evo_kiosk_browser"
+path = "src/lib.rs"
+
+[[bin]]
+name = "evo-kiosk-browser"
+path = "src/main.rs"
+required-features = ["webkit"]
+
+# Intentionally does NOT depend on evo-core. Mint uses /run/evo/kiosk.sock only.
+#
+# Host CI without GTK/WebKit headers:
+#   cargo test -p evo-kiosk-browser --lib --no-default-features
+# Device / full shell build:
+#   cargo build -p evo-kiosk-browser --release --features webkit
+
+[features]
+default = ["webkit"]
+webkit = ["dep:gtk", "dep:webkit6", "dep:glib", "dep:gio"]
+
+[dependencies]
+# Shared kiosk-settings write path + calibration wizard math.
+# Same crate the org.evoframework.system.kiosk plugin depends on;
+# both the local WebKit handlers and the remote WS plugin write
+# identical bytes because they call into this crate.
+evo-kiosk-config = { path = "../evo-kiosk-config", version = "0.1.0" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+# socket2 gives us a bounded `connect_timeout` on AF_UNIX. Stdlib's
+# `UnixStream::connect` blocks indefinitely if the peer's accept path
+# hangs (a `SIGSTOP`'d listener, an over-loaded steward). The
+# `mint_with_retry` loop bounds the total time but each `connect` call
+# must itself be bounded.
+socket2 = { version = "0.5", features = ["all"] }
+
+# `url` parses the operator-supplied kiosk URL so `NavigationAction`
+# can gate on origin (scheme + host + port). Hand-parsing the URL for
+# an allowlist policy is a class of bug the operator does not want
+# maintained here.
+url = "2"
+
+gtk = { package = "gtk4", version = "0.9", features = ["v4_10"], optional = true }
+webkit6 = { version = "0.4", features = ["v2_44"], optional = true }
+glib = { version = "0.20", optional = true }
+gio = { version = "0.20", optional = true }
+
+[dev-dependencies]
+tempfile = "3"

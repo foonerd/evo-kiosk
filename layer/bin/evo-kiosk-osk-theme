@@ -1,0 +1,222 @@
+#!/bin/sh
+# SPDX-License-Identifier: BUSL-1.1
+#
+# evo-kiosk-osk-theme — resolve the active UI theme, install the
+# matching pack CSS, and (re)start squeekboard with the correct
+# GTK_THEME base.
+#
+# Called by:
+#   - evo-kiosk-session at boot, before the browser exec, when
+#     OSK=squeekboard.
+#   - evo-kiosk-watch-settings on any change to the UI publish
+#     record (/var/lib/evo/ui/osk_theme or /run/evo/ui-osk-theme).
+#
+# Runs as the kiosk service user inside the wayland session. NEVER
+# runs as root — no sudo, no /etc write.
+#
+# Contract with the UI team (source of truth: docs/KIOSK.md):
+#   - Allowed theme ids: evo-default, night-sky, sunrise, air, liquid
+#   - Pack location: /opt/evo/ui/current/osk/gtk/<id>.css
+#   - Active CSS target: $HOME/.config/gtk-3.0/gtk.css
+#   - GTK_THEME base map:
+#       evo-default | night-sky | sunrise | liquid  →  Adwaita:dark
+#       air                                          →  Adwaita
+#   - Fallback id: evo-default
+#
+# Resolution priority for the active id:
+#   1. /var/lib/evo/ui/osk_theme         (persistent publish record)
+#   2. /run/evo/ui-osk-theme             (ephemeral publish record)
+#   3. /opt/evo/ui/data/settings.json    .settings["ui.theme"]
+#   4. evo-default
+#
+# On any missing pack / missing publish record the helper degrades
+# gracefully: it never fails the session start, it always leaves
+# squeekboard running (with stock Adwaita chrome if no pack survives
+# the fallback chain), and it logs one clear line per fallback step.
+
+set -eu
+
+log() {
+    printf '[kiosk-osk-theme] %s\n' "$*" >&2
+}
+
+FALLBACK_THEME="evo-default"
+ALLOWED_THEMES="evo-default night-sky sunrise air liquid"
+PACKS_ROOT="/opt/evo/ui/current/osk/gtk"
+SETTINGS_JSON="/opt/evo/ui/data/settings.json"
+PUBLISH_RECORDS="/var/lib/evo/ui/osk_theme /run/evo/ui-osk-theme"
+SQUEEKBOARD_PIDFILE="${XDG_RUNTIME_DIR:-/tmp}/evo-kiosk-squeekboard.pid"
+# Cache of the last-applied theme id. Consulted by the entry
+# point to skip a squeekboard cycle when the runtime rewrites
+# settings.json for an unrelated Apply — the watcher fires on
+# any settings.json change but the OSK does not need to blink
+# every time an operator nudges the volume step.
+LAST_APPLIED_FILE="${XDG_RUNTIME_DIR:-/tmp}/evo-kiosk-osk-theme.last"
+
+# ---------------------------- resolution ------------------------------
+
+theme_allowed() {
+    for t in ${ALLOWED_THEMES}; do
+        [ "$1" = "${t}" ] && return 0
+    done
+    return 1
+}
+
+read_first_line() {
+    if [ -r "$1" ]; then
+        head -1 "$1" 2>/dev/null | tr -d '\r\n' || true
+    fi
+}
+
+resolve_theme() {
+    for f in ${PUBLISH_RECORDS}; do
+        v=$(read_first_line "${f}")
+        if [ -n "${v}" ]; then
+            printf '%s' "${v}"
+            return
+        fi
+    done
+    if [ -r "${SETTINGS_JSON}" ] && command -v python3 >/dev/null 2>&1; then
+        v=$(python3 - "${SETTINGS_JSON}" <<'PY' 2>/dev/null | head -1
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    v = str(d.get("settings", {}).get("ui.theme", "")).strip()
+    if v:
+        print(v)
+except Exception:
+    sys.exit(0)
+PY
+)
+        if [ -n "${v}" ]; then
+            printf '%s' "${v}"
+            return
+        fi
+    fi
+    printf '%s' "${FALLBACK_THEME}"
+}
+
+gtk_theme_base_for() {
+    case "$1" in
+        air)                                        printf 'Adwaita' ;;
+        evo-default|night-sky|sunrise|liquid)       printf 'Adwaita:dark' ;;
+        *)                                          printf 'Adwaita:dark' ;;
+    esac
+}
+
+# ---------------------------- pack install ----------------------------
+
+install_pack_recursive() {
+    _theme="$1"
+    _pack="${PACKS_ROOT}/${_theme}.css"
+    if [ ! -r "${_pack}" ]; then
+        if [ "${_theme}" = "${FALLBACK_THEME}" ]; then
+            log "WARN: fallback pack ${_pack} missing; leaving gtk.css unchanged (stock Adwaita chrome)"
+            return 1
+        fi
+        log "WARN: pack for '${_theme}' missing at ${_pack}; falling back to ${FALLBACK_THEME}"
+        install_pack_recursive "${FALLBACK_THEME}"
+        return $?
+    fi
+    _dest_dir="${HOME}/.config/gtk-3.0"
+    _dest="${_dest_dir}/gtk.css"
+    mkdir -p "${_dest_dir}"
+    if ! cp -f "${_pack}" "${_dest}"; then
+        log "WARN: failed to copy ${_pack} → ${_dest}"
+        return 1
+    fi
+    return 0
+}
+
+# ---------------------------- squeekboard mgmt ------------------------
+
+stop_squeekboard() {
+    if [ -f "${SQUEEKBOARD_PIDFILE}" ]; then
+        _old=$(cat "${SQUEEKBOARD_PIDFILE}" 2>/dev/null || true)
+        if [ -n "${_old}" ] && kill -0 "${_old}" 2>/dev/null; then
+            kill "${_old}" 2>/dev/null || true
+            wait "${_old}" 2>/dev/null || true
+        fi
+        rm -f "${SQUEEKBOARD_PIDFILE}"
+    fi
+    # Belt-and-braces: also reap any squeekboard the pidfile lost track
+    # of (fresh install where the session spawned squeekboard before
+    # this helper existed, or a manual restart mid-session).
+    if command -v pgrep >/dev/null 2>&1; then
+        for _pid in $(pgrep -u "$(id -u)" -x squeekboard 2>/dev/null || true); do
+            kill "${_pid}" 2>/dev/null || true
+            wait "${_pid}" 2>/dev/null || true
+        done
+    fi
+}
+
+start_squeekboard() {
+    _base="$1"
+    if ! command -v squeekboard >/dev/null 2>&1; then
+        log "squeekboard not installed; skipping OSK start (theme apply still wrote gtk.css)"
+        return 0
+    fi
+    if command -v gsettings >/dev/null 2>&1; then
+        gsettings set org.gnome.desktop.a11y.applications screen-keyboard-enabled true 2>/dev/null || true
+    fi
+    # Per-spawn env: keeps the caller's own env clean and avoids a
+    # stale GTK_THEME leaking into a subsequent restart with a
+    # different theme.
+    # Detach from the caller session (same HUP class as watch-settings
+    # when launched under evo-kiosk-session before exec browser).
+    _log="${XDG_RUNTIME_DIR:-/tmp}/evo-kiosk-squeekboard.log"
+    if command -v setsid >/dev/null 2>&1; then
+        setsid -f env GTK_THEME="${_base}" squeekboard >>"${_log}" 2>&1
+        # Best-effort pid capture for the pidfile short-circuit.
+        sleep 0.1
+        _new=$(pgrep -n -x squeekboard 2>/dev/null || true)
+    else
+        (
+            trap '' HUP
+            exec env GTK_THEME="${_base}" squeekboard >>"${_log}" 2>&1
+        ) &
+        _new=$!
+    fi
+    printf '%s' "${_new}" > "${SQUEEKBOARD_PIDFILE}"
+    log "squeekboard started pid=${_new:-?} GTK_THEME=${_base}"
+}
+
+# ---------------------------- entry point -----------------------------
+
+theme=$(resolve_theme)
+if ! theme_allowed "${theme}"; then
+    log "resolved theme '${theme}' not in allowed set; using ${FALLBACK_THEME}"
+    theme="${FALLBACK_THEME}"
+fi
+
+# Idempotent short-circuit: if the resolved theme is identical to
+# the last-applied one AND squeekboard is still alive under the
+# tracked pid, an unrelated settings.json rewrite (e.g. an
+# unrelated Apply the watcher forwards to us) is a no-op — no
+# CSS rewrite, no squeekboard cycle. gtk.css already reflects the
+# current pack, GTK_THEME is already set on the running process.
+last=""
+if [ -r "${LAST_APPLIED_FILE}" ]; then
+    last=$(head -1 "${LAST_APPLIED_FILE}" 2>/dev/null | tr -d '\r\n' || true)
+fi
+sq_pid=""
+if [ -r "${SQUEEKBOARD_PIDFILE}" ]; then
+    sq_pid=$(head -1 "${SQUEEKBOARD_PIDFILE}" 2>/dev/null | tr -d '\r\n' || true)
+fi
+if [ -n "${last}" ] && [ "${last}" = "${theme}" ] \
+   && [ -n "${sq_pid}" ] && kill -0 "${sq_pid}" 2>/dev/null; then
+    log "OSK theme unchanged (theme=${theme} squeekboard=${sq_pid}); no-op"
+    exit 0
+fi
+
+install_pack_recursive "${theme}" || true
+base=$(gtk_theme_base_for "${theme}")
+log "OSK theme applied: theme=${theme} base=${base}"
+
+stop_squeekboard
+start_squeekboard "${base}"
+
+# Record the applied theme AFTER the successful spawn so an aborted
+# apply (helper killed mid-flight) does not falsely mark the theme
+# as current on the next invocation.
+printf '%s\n' "${theme}" > "${LAST_APPLIED_FILE}" 2>/dev/null || true

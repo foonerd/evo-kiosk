@@ -1,0 +1,7 @@
+/target/
+**/*.rs.bk
+.DS_Store
+*.swp
+# Offline-staging sink for KIOSK_BROWSER_SOURCE=layer installs.
+# Populated locally by copying cross-build output; never committed.
+/layer/binaries/

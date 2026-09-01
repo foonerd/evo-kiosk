@@ -1,0 +1,84 @@
+#!/bin/sh
+# SPDX-License-Identifier: BUSL-1.1
+# evo-kiosk-plymouth-handoff - root-context Plymouth handoff.
+#
+# The kiosk ExecStart runs as an unprivileged service user (User= in the
+# distribution drop-in). Plymouth control commands (deactivate / quit /
+# --ping) talk to plymouthd's privileged socket and require root, so the
+# session scripts CANNOT do the handoff themselves. This helper is invoked
+# from evo-kiosk.service with systemd's '+' prefix, which runs it as root
+# regardless of User=.
+#
+# Seamless-handoff Phase 2, mainstream DM shape:
+#   deactivate  (ExecStartPre, before labwc): idle plymouthd and drop DRM
+#               master WITHOUT restoring the console or freeing the splash
+#               framebuffer, so labwc can take DRM master while the last
+#               splash frame stays on screen - no blank between splash and
+#               compositor.
+#   quit        (ExecStartPost, after labwc has the display): release
+#               plymouthd with --retain-splash once the compositor owns the
+#               panel. A short settle covers labwc's output bring-up. Run
+#               detached so it does not hold up unit activation.
+#
+# Best-effort throughout: a missing or already-gone plymouth is not an
+# error (the unit's OnFailure=plymouth-quit.service is the backstop if labwc
+# dies before the compositor is up).
+
+set -eu
+
+log() { printf '[kiosk-handoff] %s\n' "$*"; }
+
+if ! command -v plymouth >/dev/null 2>&1; then
+  log "plymouth binary absent; nothing to do"
+  exit 0
+fi
+
+mode="${1:-deactivate}"
+
+# shutdown: mirror of the boot deactivate, but at unit STOP. As the kiosk
+# exits during a real system reboot/poweroff, bring the Plymouth splash back
+# up so the panel goes kiosk -> splash with NO console flash (the getty
+# reclaims tty1 the moment the kiosk's Conflicts=getty@tty1 releases,
+# ~1.5s before plymouth-reboot.service shows its splash). Plymouthd was quit
+# at boot, so start it in shutdown mode first if needed. Handled BEFORE the
+# --ping guard because plymouthd is not running here.
+#   - Gated on `systemctl is-system-running` == stopping so it NEVER fires on
+#     a mid-session kiosk restart (Restart=always), only on real shutdown.
+#   - Every step is `timeout`-bounded + best-effort so it can never delay or
+#     wedge the shutdown transaction (the unit also carries TimeoutStopSec).
+if [ "${mode}" = "shutdown" ]; then
+  state="$(systemctl is-system-running 2>/dev/null || true)"
+  if [ "${state}" != "stopping" ]; then
+    log "not a system shutdown (state=${state:-unknown}); skipping shutdown splash"
+    exit 0
+  fi
+  if ! plymouth --ping >/dev/null 2>&1; then
+    timeout 2 plymouthd --mode=shutdown --attach-to-session >/dev/null 2>&1 || true
+  fi
+  timeout 2 plymouth --show-splash >/dev/null 2>&1 || true
+  log "shutdown splash shown (kiosk -> plymouth handoff on system stop)"
+  exit 0
+fi
+
+if ! plymouth --ping >/dev/null 2>&1; then
+  log "plymouthd not responding (already gone?); nothing to do"
+  exit 0
+fi
+
+case "${mode}" in
+  deactivate)
+    plymouth deactivate >/dev/null 2>&1 || true
+    log "plymouth deactivate (splash retained on FB, DRM master dropped)"
+    ;;
+  quit)
+    # Settle so labwc has taken DRM master + done its first modeset before
+    # we release plymouthd. Bounded; default 2s, override via arg 2.
+    sleep "${2:-2}"
+    plymouth quit --retain-splash >/dev/null 2>&1 || true
+    log "plymouth quit --retain-splash (compositor owns the panel)"
+    ;;
+  *)
+    log "unknown mode '${mode}' (expected deactivate|quit)"
+    exit 0
+    ;;
+esac

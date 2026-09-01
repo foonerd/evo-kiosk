@@ -1,17 +1,32 @@
-# evo-kiosk
+# evo kiosk engineering workspace
 
-Public release repository for the evo on-device kiosk session shell.
+Implementation workspace for the on-device kiosk session shell.
 
 ## Purpose
 
-`evo-kiosk` is the curated public release stream for the on-device compositor session and kiosk browser that present the local evo UI on reference display devices.
+High-velocity workspace for:
 
-## Scope
+- Wayland compositor session (labwc) and systemd units
+- GTK4 + webkit2gtk kiosk browser binary
+- mint on `/run/evo/kiosk.sock` and origin-bound cookie inject
+- install / deploy scripts and cross-built prebuilts
+- Plymouth handoff coordination (theme assets stay in the boot repo)
 
-- Wayland compositor session and kiosk browser shell for on-device use
-- Install and systemd integration for non-headless reference devices
-- Release packaging aligned with evo runtime and UI contracts
+## Does not own
 
-## Ownership and marks
+- Plymouth theme (owned by the boot workspace)
+- UI SPA (owned by the UI workspace)
+- Framework mint wire semantics (owned by the framework core)
+- Distribution UID allowlist and packaging hooks (owned by the audio device distribution)
 
-`evo` and `evoframework` names/marks are controlled by the project owner.
+## Layout
+
+- `crates/kiosk-browser/` - standalone WebKit kiosk binary
+- `layer/` - systemd units, labwc config, launch/session/preflight helpers
+- `scripts/install/` - device install helpers
+- `scripts/release/` - pre-tag / promote helpers
+- `docs/` - kiosk contract
+
+## Contract
+
+Delivers the operator-facing kiosk browser + boot integration + hardware acceptance surface.

@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: BUSL-1.1
+# Applies the LIBINPUT_CALIBRATION_MATRIX for every attached
+# touchscreen based on the current overlay values in
+# /var/lib/evo/settings/kiosk/. Fired at boot (via kiosk.service
+# Wants=) and on every overlay write (via the paired .path unit).
+#
+# Runs as root because it writes /etc/udev/rules.d/ and calls
+# udevadm. The kiosk.service itself runs as the compositor user
+# with NoNewPrivileges=yes, so a sudo path from there would be
+# blocked; systemd owning this unit sidesteps the conflict.
+
+[Unit]
+Description=evo kiosk touchscreen calibration apply
+Documentation=https://github.com/foonerd/evo-kiosk-eng
+After=systemd-udevd.service
+# When the compositor unit is running, apply-time races with the
+# session's own reads of libinput are harmless (the calibration is
+# a udev property; libinput re-reads on device event). Ordering
+# just prevents log-line interleave.
+Before=evo-kiosk.service
+# Disable systemd's start-rate limit. The paired .path unit
+# watches the whole settings/kiosk/ directory (see the .path
+# file for why file-inode watches were unusable), so this
+# service is legitimately triggered on every overlay write —
+# touch_*, brightness, sleep_*, calibrate_trigger, etc. An
+# operator opening a UI settings pane that dirties multiple
+# overlays can easily produce more than the systemd default
+# StartLimitBurst=5 within StartLimitIntervalSec=10s and lock
+# the service out. The service is idempotent (compares the
+# composed matrix against the current udev rule and exits 0
+# without side-effect when they match), bounded (TimeoutStartSec
+# above), and not a crash loop, so the start limit's protection
+# is unnecessary here and would just cause dropped applies. See
+# systemd.unit(5) — "0 disables the rate limiting."
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+ExecStart=/usr/local/sbin/evo-kiosk-touch-calibrate
+StandardOutput=journal
+StandardError=journal
+# Bounded runtime — the helper is a shell script with a single
+# udev write and a udevadm reload; anything over a couple of
+# seconds means udevadm hung.
+TimeoutStartSec=15s
+
+[Install]
+WantedBy=multi-user.target

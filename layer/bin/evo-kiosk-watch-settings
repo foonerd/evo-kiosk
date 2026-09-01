@@ -1,0 +1,324 @@
+#!/bin/sh
+# SPDX-License-Identifier: BUSL-1.1
+# evo-kiosk-watch-settings — live-apply operator settings that
+# require the compositor session context.
+#
+# Watches the kiosk settings overlay directory and re-applies each
+# axis without restarting the compositor:
+#   - display_rotation  →  wlr-randr --output <name> --transform <T>
+#   - touch_rotation, touch_hflip, touch_vflip  →
+#         evo-kiosk-touch-calibrate .path/.service (root-side)
+#         handles the udev rule + unbind/bind cycle; this watcher
+#         does not touch that path.
+#   - sleep_timeout_seconds, sleep_inhibit_while_playing,
+#     sleep_inhibit_active  →  respawn swayidle child with the
+#         merged effective timeout. swayidle drives wlopm to power
+#         the outputs off via the wlr-output-power-management-v1
+#         protocol; any input event resumes.
+#
+# Runs as a labwc client (spawned from evo-kiosk-session) so its
+# lifetime is bound to the compositor session: labwc exits →
+# session exits → this exits with it. Its swayidle child dies
+# with it via the pidfile-guarded kill on exit.
+#
+# Uses inotifywait when available; falls back to polling mtimes at
+# 1s cadence when inotify-tools is missing (still functional, just
+# less snappy).
+#
+# Debounced: applies at most one refresh per 300ms so a batch write
+# (framework wire op that touches all four overlays) triggers a
+# single apply, not four.
+
+set -eu
+
+SETTINGS_DIR="${KIOSK_SETTINGS_DIR:-/var/lib/evo/settings/kiosk}"
+DEBOUNCE_MS=300
+
+# Pidfile for the swayidle child. Lives under XDG_RUNTIME_DIR
+# (per-user, cleaned up automatically on session end); falls back
+# to /tmp when XDG_RUNTIME_DIR is unset (should not happen under
+# pam_systemd but the check keeps the script defensive).
+SWAYIDLE_PIDFILE="${XDG_RUNTIME_DIR:-/tmp}/evo-kiosk-swayidle.pid"
+
+log() {
+    printf '[kiosk-watch] %s\n' "$*"
+}
+
+# Read a single-line overlay file; fall back to $2 if unreadable or blank.
+read_overlay() {
+    file="${SETTINGS_DIR}/$1"
+    default="$2"
+    if [ -r "${file}" ]; then
+        v=$(head -1 "${file}" 2>/dev/null | tr -d '\r\n' || true)
+        if [ -n "${v}" ]; then
+            printf '%s' "${v}"
+            return
+        fi
+    fi
+    printf '%s' "${default}"
+}
+
+# Which output does wlr-randr call --transform on? Pick the first
+# enabled one. Matches evo-kiosk-session's own detection logic so
+# both operate on the same output.
+first_enabled_output() {
+    if ! command -v wlr-randr >/dev/null 2>&1; then
+        return
+    fi
+    out=$(wlr-randr 2>/dev/null || true)
+    name=""
+    current=""
+    printf '%s\n' "${out}" | while IFS= read -r line; do
+        case "${line}" in
+            [!\ ]*)
+                current=$(printf '%s' "${line}" | awk '{print $1}')
+                ;;
+            *Enabled:\ yes*)
+                if [ -n "${current}" ]; then
+                    printf '%s' "${current}"
+                    exit 0
+                fi
+                ;;
+        esac
+    done
+}
+
+apply_display_rotation() {
+    rot="$1"
+    case "${rot}" in
+        0|normal) t=normal ;;
+        90|180|270) t="${rot}" ;;
+        *) log "WARN: invalid display_rotation '${rot}'; skipping"; return ;;
+    esac
+    name=$(first_enabled_output)
+    if [ -z "${name}" ]; then
+        log "WARN: no enabled output for wlr-randr; skipping display rotation"
+        return
+    fi
+    if wlr-randr --output "${name}" --transform "${t}" 2>/dev/null; then
+        log "display rotation → ${t} on ${name}"
+    else
+        log "WARN: wlr-randr --transform ${t} failed on ${name}"
+    fi
+}
+
+# ---------------------------- sleep apply -----------------------------
+#
+# labwc 0.9.8 has no <idle> config element (labwc-config(5) delegates
+# idle/powersave to an external client). We manage a swayidle child
+# process that runs `wlopm --off '*'` on timeout and `wlopm --on '*'`
+# on resume. On any change to the effective timeout we kill the
+# existing swayidle and (unless disabled) spawn a fresh one.
+#
+# Effective timeout = base seconds unless inhibit-while-playing is
+# enabled AND MPD-driven inhibit-active flag is true, in which case
+# the timeout is disabled (0 = do not arm swayidle).
+
+stop_swayidle() {
+    if [ -f "${SWAYIDLE_PIDFILE}" ]; then
+        old_pid=$(cat "${SWAYIDLE_PIDFILE}" 2>/dev/null || true)
+        if [ -n "${old_pid}" ] && kill -0 "${old_pid}" 2>/dev/null; then
+            kill "${old_pid}" 2>/dev/null || true
+            # Reap the child so it does not accumulate as a zombie over
+            # many settings changes. `wait` returns immediately (and
+            # errors harmlessly) if the pid is not a child of this
+            # shell — safe in the inotify subshell where the child was
+            # spawned in the same iteration context.
+            wait "${old_pid}" 2>/dev/null || true
+        fi
+        rm -f "${SWAYIDLE_PIDFILE}"
+    fi
+}
+
+apply_sleep() {
+    base=$(read_overlay sleep_timeout_seconds "120")
+    if ! echo "${base}" | grep -qE '^[0-9]+$'; then
+        log "sleep_timeout_seconds '${base}' not a non-negative integer; using 120"
+        base=120
+    fi
+    inhibit_toggle=$(read_overlay sleep_inhibit_while_playing "true")
+    inhibit_active=$(read_overlay sleep_inhibit_active "false")
+
+    effective="${base}"
+    if [ "${inhibit_toggle}" = "true" ] && [ "${inhibit_active}" = "true" ]; then
+        effective=0
+    fi
+
+    stop_swayidle
+
+    if [ "${effective}" -eq 0 ]; then
+        log "sleep disabled (base=${base}s, inhibit_toggle=${inhibit_toggle}, inhibit_active=${inhibit_active})"
+        return 0
+    fi
+
+    if ! command -v swayidle >/dev/null 2>&1; then
+        log "WARN: swayidle not installed; sleep timeout unenforced"
+        return 0
+    fi
+    if ! command -v wlopm >/dev/null 2>&1; then
+        log "WARN: wlopm not installed; sleep timeout unenforced"
+        return 0
+    fi
+
+    # swayidle -w keeps it in foreground; we background it and record
+    # the pid so we can kill+respawn on the next settings change. The
+    # single-quoted 'wlopm --off "*"' string is what swayidle passes to
+    # `sh -c`; the inner double-quotes protect `*` from being glob-
+    # expanded by that shell against cwd, so wlopm receives a literal
+    # `*` (its "all outputs" selector).
+    swayidle -w \
+        timeout "${effective}" 'wlopm --off "*"' \
+        resume 'wlopm --on "*"' \
+        >/dev/null 2>&1 &
+    new_pid=$!
+    echo "${new_pid}" > "${SWAYIDLE_PIDFILE}"
+    log "sleep armed: swayidle pid=${new_pid} timeout=${effective}s (base=${base}s, inhibit_toggle=${inhibit_toggle}, inhibit_active=${inhibit_active})"
+}
+
+apply_all() {
+    display_rot_raw=$(read_overlay display_rotation "$(read_overlay rotation 0)")
+    apply_display_rotation "${display_rot_raw}"
+    apply_sleep
+}
+
+# ---------------------------- lifecycle -------------------------------
+
+# Kill the swayidle child when this watcher exits (session end).
+trap 'stop_swayidle' EXIT INT TERM
+
+# On first tick, apply whatever the overlays currently say. Ensures a
+# session started after an overlay edit picks up the new state even
+# if inotify missed the create event.
+apply_all
+
+mkdir -p "${SETTINGS_DIR}" 2>/dev/null || true
+
+# UI theme trigger paths.
+#
+# The AUTHORITATIVE source is the runtime-owned settings.json —
+# the UI runtime rewrites it atomically (tempfile + rename) on
+# every committed Apply, and the helper already reads
+# `.settings["ui.theme"]` from it. Watching the containing dir
+# (not the file inode) is what catches the rename — an inode
+# watch would be silently blown away by the atomic replace and
+# subsequent events would never fire. `moved_to` on the dir is
+# the event that lands.
+#
+# The publish record dirs are optional overrides kept from the
+# original spec — persistent (survives reboot) + ephemeral
+# (regenerated at boot). No producer writes them today but the
+# helper's resolution chain honours them first when they exist.
+#
+# CRITICAL: inotifywait exits non-zero if ANY watch root is
+# missing. A post-wipe host often lacks /var/lib/evo/ui (mkdir
+# as the kiosk user can also fail when /var/lib/evo is root-only).
+# Passing a missing path used to kill this whole daemon after the
+# "watcher started" log line — remote Display & Touch then only
+# updated overlays until evo-kiosk was restarted. Only watch roots
+# that exist; fall back to polling if inotify cannot arm.
+UI_SETTINGS_DIR="/opt/evo/ui/data"
+UI_PUBLISH_DIR_VAR="/var/lib/evo/ui"
+UI_PUBLISH_DIR_RUN="/run/evo"
+mkdir -p "${SETTINGS_DIR}" "${UI_PUBLISH_DIR_VAR}" 2>/dev/null || true
+
+apply_osk_theme() {
+    if [ ! -x /usr/local/bin/evo-kiosk-osk-theme ]; then
+        log "WARN: /usr/local/bin/evo-kiosk-osk-theme missing; skipping OSK theme apply"
+        return 0
+    fi
+    /usr/local/bin/evo-kiosk-osk-theme || log "WARN: evo-kiosk-osk-theme returned non-zero"
+}
+
+# Build the list of watch roots that actually exist. Missing
+# optional publish dirs are skipped (and logged once) rather than
+# aborting the live-apply loop.
+watch_roots=""
+for d in "${SETTINGS_DIR}" "${UI_SETTINGS_DIR}" \
+         "${UI_PUBLISH_DIR_VAR}" "${UI_PUBLISH_DIR_RUN}"; do
+    if [ -d "${d}" ]; then
+        watch_roots="${watch_roots} ${d}"
+    else
+        log "WARN: watch root missing, skipping: ${d}"
+    fi
+done
+# Trim leading space for prettier logs / argv.
+watch_roots=$(printf '%s' "${watch_roots}" | sed 's/^ //')
+
+run_poll_loop() {
+    log "watcher started (polling) on ${watch_roots:-<none>}"
+    last_stamp=""
+    while true; do
+        stamp=""
+        for f in display_rotation touch_rotation touch_hflip touch_vflip rotation \
+                 sleep_timeout_seconds sleep_inhibit_while_playing sleep_inhibit_active; do
+            path="${SETTINGS_DIR}/${f}"
+            if [ -r "${path}" ]; then
+                m=$(stat -c '%Y' "${path}" 2>/dev/null || echo 0)
+                stamp="${stamp}${f}=${m};"
+            fi
+        done
+        for path in "${UI_SETTINGS_DIR}/settings.json" \
+                    "${UI_PUBLISH_DIR_VAR}/osk_theme" \
+                    "${UI_PUBLISH_DIR_RUN}/ui-osk-theme"; do
+            if [ -r "${path}" ]; then
+                m=$(stat -c '%Y' "${path}" 2>/dev/null || echo 0)
+                stamp="${stamp}$(basename "${path}")=${m};"
+            fi
+        done
+        if [ "${stamp}" != "${last_stamp}" ] && [ -n "${last_stamp}" ]; then
+            apply_all
+            apply_osk_theme
+        fi
+        last_stamp="${stamp}"
+        sleep 1
+    done
+}
+
+run_inotify_loop() {
+    # shellcheck disable=SC2086
+    log "watcher started (inotify) on ${watch_roots}"
+    # Do not swallow inotifywait stderr — a missing root or
+    # permission error must be visible in the session log. Keep
+    # the pipe alive only while inotifywait runs; if it exits we
+    # fall through to polling so live rotation never goes dark.
+    # shellcheck disable=SC2086
+    inotifywait -m -q -r \
+        -e create -e modify -e moved_to -e close_write \
+        --format '%f' \
+        ${watch_roots} \
+        | while IFS= read -r name; do
+        case "${name}" in
+            display_rotation|touch_rotation|touch_hflip|touch_vflip|rotation)
+                sleep "0.$(printf '%03d' "${DEBOUNCE_MS}")"
+                display_rot_raw=$(read_overlay display_rotation "$(read_overlay rotation 0)")
+                apply_display_rotation "${display_rot_raw}"
+                ;;
+            sleep_timeout_seconds|sleep_inhibit_while_playing|sleep_inhibit_active)
+                sleep "0.$(printf '%03d' "${DEBOUNCE_MS}")"
+                apply_sleep
+                ;;
+            osk_theme|ui-osk-theme|settings.json)
+                # settings.json is the authoritative Apply signal;
+                # publish records are optional overrides. Helper
+                # short-circuits when the resolved theme has not
+                # actually changed, so an unrelated Apply (e.g. a
+                # volume-step edit that rewrites settings.json) is
+                # a cheap no-op — no squeekboard cycle.
+                sleep "0.$(printf '%03d' "${DEBOUNCE_MS}")"
+                apply_osk_theme
+                ;;
+            *) ;;
+        esac
+    done
+    log "WARN: inotifywait exited; falling back to polling"
+    run_poll_loop
+}
+
+if [ -z "${watch_roots}" ]; then
+    log "WARN: no watch roots available; polling overlays only"
+    run_poll_loop
+elif command -v inotifywait >/dev/null 2>&1; then
+    run_inotify_loop
+else
+    run_poll_loop
+fi

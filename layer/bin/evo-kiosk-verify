@@ -1,0 +1,271 @@
+#!/bin/sh
+# SPDX-License-Identifier: BUSL-1.1
+#
+# evo-kiosk-verify — verify a signed evo-kiosk release-plane
+# artefact set against the pinned trust anchor. Runs before
+# installer or distribution build script places a binary from
+# foonerd/evo-kiosk-artefacts into a system location.
+#
+# Verifies, in order:
+#   1. Channel pointer signature (channels/<channel>.sig ->
+#      channels/<channel>.toml)
+#   2. Channel pointer version is present (empty string means
+#      no release has been cut yet; refuse)
+#   3. Target architecture appears in the pointer's supported
+#      architectures list
+#   4. Build-info signature (binaries/<triple>/build-info.sig ->
+#      binaries/<triple>/build-info.toml)
+#   5. Build-info's evo_kiosk_ref matches the pointer's piece
+#      version (protects against binary-swap between arches or
+#      between channel-signed pointer and binary-signed set)
+#   6. Binary signature (binaries/<triple>/evo-kiosk-browser.sig
+#      -> binaries/<triple>/evo-kiosk-browser)
+#   7. Binary SHA-256 matches the .sha256 companion (integrity
+#      independent of signature, so a corruption during fetch
+#      surfaces distinctly from a signature failure)
+#
+# All seven gates must pass. Any failure exits non-zero and
+# emits a fail line to stderr identifying which gate hit.
+#
+# Usage:
+#   evo-kiosk-verify \
+#       --artefacts-dir /path/to/evo-kiosk-artefacts \
+#       --channel <dev|test|prod> \
+#       --target <target-triple> \
+#       [--trust-anchor /path/to/pubkey.pem]
+#
+# Defaults:
+#   trust anchor: /etc/evo/trust/evo-release-signing-public.pem
+#                 (override via EVO_KIOSK_TRUST_ANCHOR env)
+#
+# On success:
+#   stdout: one machine-readable evidence line beginning with
+#           "verify-ok" followed by tab-separated fields.
+#   exit:   0
+#
+# On failure:
+#   stderr: "[verify] FAIL: <reason>"
+#   exit:   non-zero (see codes below)
+#
+# Exit codes:
+#   0  every gate verified
+#   1  argument / preflight failure (missing tool, missing flag)
+#   2  trust anchor missing or unreadable
+#   3  signature verify failure (any of the three sig checks)
+#   4  SHA-256 mismatch
+#   5  policy mismatch (empty version, arch not supported,
+#      pointer/build-info version mismatch)
+
+set -eu
+
+log_fail() {
+    printf '[verify] FAIL: %s\n' "$*" >&2
+}
+
+log_ok() {
+    printf '[verify] OK: %s\n' "$*" >&2
+}
+
+ARTEFACTS_DIR=""
+CHANNEL=""
+TARGET=""
+TRUST_ANCHOR="${EVO_KIOSK_TRUST_ANCHOR:-/etc/evo/trust/evo-release-signing-public.pem}"
+
+usage() {
+    cat >&2 <<EOF
+usage: evo-kiosk-verify --artefacts-dir DIR --channel NAME --target TRIPLE [--trust-anchor PEM]
+EOF
+    exit 1
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --artefacts-dir) ARTEFACTS_DIR="$2"; shift 2 ;;
+        --channel) CHANNEL="$2"; shift 2 ;;
+        --target) TARGET="$2"; shift 2 ;;
+        --trust-anchor) TRUST_ANCHOR="$2"; shift 2 ;;
+        -h|--help) usage ;;
+        *) log_fail "unknown flag: $1"; usage ;;
+    esac
+done
+
+if [ -z "${ARTEFACTS_DIR}" ] || [ -z "${CHANNEL}" ] || [ -z "${TARGET}" ]; then
+    log_fail "missing required flag"
+    usage
+fi
+
+case "${CHANNEL}" in
+    dev|test|prod) : ;;
+    *) log_fail "invalid channel: ${CHANNEL} (dev|test|prod)"; exit 1 ;;
+esac
+
+# ------------------------------- preflight -----------------------
+
+if ! command -v openssl >/dev/null 2>&1; then
+    log_fail "openssl not on PATH (required for signature verify)"
+    exit 1
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+    log_fail "python3 not on PATH (required for TOML parse)"
+    exit 1
+fi
+
+if ! command -v sha256sum >/dev/null 2>&1; then
+    log_fail "sha256sum not on PATH (required for integrity check)"
+    exit 1
+fi
+
+if [ ! -r "${TRUST_ANCHOR}" ]; then
+    log_fail "trust anchor missing or unreadable: ${TRUST_ANCHOR}"
+    exit 2
+fi
+
+if [ ! -d "${ARTEFACTS_DIR}" ]; then
+    log_fail "artefacts dir not a directory: ${ARTEFACTS_DIR}"
+    exit 1
+fi
+
+# ------------------------------- gate 1: pointer sig -------------
+
+pointer_toml="${ARTEFACTS_DIR}/channels/${CHANNEL}.toml"
+pointer_sig="${ARTEFACTS_DIR}/channels/${CHANNEL}.sig"
+
+if [ ! -r "${pointer_toml}" ]; then
+    log_fail "channel pointer missing: ${pointer_toml}"
+    exit 1
+fi
+
+if [ ! -r "${pointer_sig}" ]; then
+    log_fail "channel pointer signature missing: ${pointer_sig}"
+    exit 3
+fi
+
+if ! openssl pkeyutl -verify -pubin -inkey "${TRUST_ANCHOR}" \
+        -rawin -in "${pointer_toml}" -sigfile "${pointer_sig}" \
+        >/dev/null 2>&1; then
+    log_fail "channel pointer signature does not verify: ${pointer_toml}"
+    exit 3
+fi
+log_ok "gate 1/7 channel pointer signature verified"
+
+# ------------------------------- gate 2 + 3: parse pointer -------
+
+pointer_state="$(mktemp)"
+trap 'rm -f "${pointer_state}"' EXIT INT TERM
+
+# Emit tab-separated key\tvalue lines. Fields:
+#   version <string>
+#   arch <string>  (one line per supported architecture)
+python3 - "${pointer_toml}" > "${pointer_state}" <<'PY'
+import sys, tomllib
+with open(sys.argv[1], "rb") as f:
+    data = tomllib.load(f)
+pointers = data.get("pointers", []) or []
+for p in pointers:
+    piece = p.get("piece", "")
+    if piece != "evo-kiosk-browser":
+        continue
+    print(f"version\t{p.get('version', '')}")
+for a in (data.get("architectures", []) or []):
+    print(f"arch\t{a}")
+PY
+
+pointer_version="$(awk -F'\t' '$1=="version"{print $2; exit}' "${pointer_state}")"
+if [ -z "${pointer_version}" ]; then
+    log_fail "channel pointer names no evo-kiosk-browser piece or empty version (release not cut)"
+    exit 5
+fi
+log_ok "gate 2/7 channel pointer version present: ${pointer_version}"
+
+if ! awk -F'\t' -v want="${TARGET}" '$1=="arch" && $2==want{found=1} END{exit !found}' "${pointer_state}"; then
+    log_fail "target ${TARGET} not in channel pointer's supported architectures"
+    exit 5
+fi
+log_ok "gate 3/7 target ${TARGET} present in pointer supported architectures"
+
+# ------------------------------- gate 4: build-info sig ----------
+
+bin_dir="${ARTEFACTS_DIR}/binaries/${TARGET}"
+build_info="${bin_dir}/build-info.toml"
+build_info_sig="${bin_dir}/build-info.sig"
+
+if [ ! -r "${build_info}" ]; then
+    log_fail "build-info missing: ${build_info}"
+    exit 1
+fi
+if [ ! -r "${build_info_sig}" ]; then
+    log_fail "build-info signature missing: ${build_info_sig}"
+    exit 3
+fi
+
+if ! openssl pkeyutl -verify -pubin -inkey "${TRUST_ANCHOR}" \
+        -rawin -in "${build_info}" -sigfile "${build_info_sig}" \
+        >/dev/null 2>&1; then
+    log_fail "build-info signature does not verify: ${build_info}"
+    exit 3
+fi
+log_ok "gate 4/7 build-info signature verified"
+
+# ------------------------------- gate 5: build-info version xref -
+
+build_info_ref="$(python3 - "${build_info}" <<'PY'
+import sys, tomllib
+with open(sys.argv[1], "rb") as f:
+    data = tomllib.load(f)
+print(data.get("evo_kiosk_ref", ""))
+PY
+)"
+
+if [ "${build_info_ref}" != "${pointer_version}" ]; then
+    log_fail "build-info evo_kiosk_ref=${build_info_ref} does not match channel pointer version=${pointer_version}"
+    exit 5
+fi
+log_ok "gate 5/7 build-info version matches channel pointer"
+
+# ------------------------------- gate 6: binary sig --------------
+
+binary="${bin_dir}/evo-kiosk-browser"
+binary_sig="${bin_dir}/evo-kiosk-browser.sig"
+
+if [ ! -f "${binary}" ]; then
+    log_fail "binary missing: ${binary}"
+    exit 1
+fi
+if [ ! -r "${binary_sig}" ]; then
+    log_fail "binary signature missing: ${binary_sig}"
+    exit 3
+fi
+
+if ! openssl pkeyutl -verify -pubin -inkey "${TRUST_ANCHOR}" \
+        -rawin -in "${binary}" -sigfile "${binary_sig}" \
+        >/dev/null 2>&1; then
+    log_fail "binary signature does not verify: ${binary}"
+    exit 3
+fi
+log_ok "gate 6/7 binary signature verified"
+
+# ------------------------------- gate 7: binary SHA -------------
+
+sha_file="${bin_dir}/evo-kiosk-browser.sha256"
+if [ ! -r "${sha_file}" ]; then
+    log_fail "binary sha256 file missing: ${sha_file}"
+    exit 1
+fi
+
+# `sha256sum -c` reads the .sha256 file and expects the target
+# file at the path recorded in it. Run from bin_dir so the
+# relative path in the .sha256 line resolves.
+if ! (cd "${bin_dir}" && sha256sum -c evo-kiosk-browser.sha256) >/dev/null 2>&1; then
+    log_fail "binary SHA-256 does not match .sha256 companion"
+    exit 4
+fi
+log_ok "gate 7/7 binary SHA-256 matches companion"
+
+# ------------------------------- evidence line -------------------
+
+# Machine-readable single line for the caller to record as
+# provenance evidence alongside the placed binary.
+binary_sha="$(awk '{print $1; exit}' "${sha_file}")"
+printf 'verify-ok\tchannel=%s\ttarget=%s\tversion=%s\tsha256=%s\ttrust_anchor=%s\n' \
+    "${CHANNEL}" "${TARGET}" "${pointer_version}" "${binary_sha}" "${TRUST_ANCHOR}"

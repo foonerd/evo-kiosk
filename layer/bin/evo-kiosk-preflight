@@ -1,0 +1,195 @@
+#!/bin/sh
+# SPDX-License-Identifier: BUSL-1.1
+# evo-kiosk-preflight - DRM probe + OS-dependency enforcement + kiosk.sock
+# readiness.
+#
+# Exits 0 when:
+#   - at least one /dev/dri/card* device is present,
+#   - every binary listed under `required_binaries` in
+#     kiosk.privileges.toml is resolvable on PATH,
+#   - every service listed under `required_system_services` is
+#     `active` (or `activating`),
+#   - the kiosk mint socket at /run/evo/kiosk.sock (or $EVO_KIOSK_SOCK)
+#     appears within the wait window.
+#
+# Exits 1 with a named operator-visible error otherwise. Runs as
+# ExecStartPre for evo-kiosk.service so "no display" / "OS dep missing" /
+# "steward mint socket missing" are distinct from a later ExecStart
+# failure with no context.
+#
+# Socket readiness only: waits for /run/evo/kiosk.sock. Never mints.
+# Never logs tokens.
+#
+# All dynamic configuration is read by /usr/local/bin/evo-kiosk-launch
+# from /etc/evo/kiosk.toml and overlays under /var/lib/evo/settings/kiosk/.
+#
+# Policy: the only fatal hardware condition is absence of any DRM
+# device. The unit also carries ConditionPathExistsGlob=/dev/dri/card*;
+# this script covers the race where the node vanished between activation
+# and ExecStart. Socket wait is a separate soft-start gate (~30s) so the
+# browser can mint once labwc starts.
+
+set -eu
+
+KIOSK_SOCK="${EVO_KIOSK_SOCK:-/run/evo/kiosk.sock}"
+SOCK_WAIT_SECS="${EVO_KIOSK_SOCK_WAIT_SECS:-30}"
+
+# Component privileges source of truth. Installed alongside the helper
+# scripts at /etc/evo/kiosk.privileges.toml. Overridable via
+# $EVO_KIOSK_PRIVILEGES for tests.
+PRIVILEGES_FILE="${EVO_KIOSK_PRIVILEGES:-/etc/evo/kiosk.privileges.toml}"
+
+log() {
+  printf '[kiosk-preflight] %s\n' "$*"
+}
+
+fail() {
+  log "ERROR: $*"
+  exit 1
+}
+
+# ------------------------------- DRM gate ----------------------------
+
+drm_ok=false
+for c in /dev/dri/card*; do
+  if [ -c "${c}" ]; then
+    log "DRM device present: ${c}"
+    drm_ok=true
+    break
+  fi
+done
+
+if [ "${drm_ok}" != "true" ]; then
+  fail "no /dev/dri/card* present; kiosk cannot start"
+fi
+
+# ------------------------------- OS-dependency enforcement -----------
+#
+# Parses the component's privileges declaration and refuses to start
+# the unit if any `required_binaries` entry does not resolve on PATH,
+# or any `required_system_services` entry is not `active`. Uses
+# Python `tomllib` so section shapes + array values in the file are
+# preserved verbatim.
+
+enforce_privileges() {
+  if [ ! -r "${PRIVILEGES_FILE}" ]; then
+    fail "privileges declaration missing at ${PRIVILEGES_FILE}; installer did not deploy the source of truth"
+  fi
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    fail "python3 not installed; cannot parse ${PRIVILEGES_FILE} — required binaries include python3 itself for this reason"
+  fi
+
+  # Emit `binary <name>` and `service <name>` lines for the shell to
+  # enforce. `tomllib` is stdlib on python 3.11+; error surfaces
+  # named to the operator rather than dumped as a Python traceback.
+  parsed=$(
+    python3 - "${PRIVILEGES_FILE}" <<'PY' 2>/dev/null || printf ''
+import sys
+try:
+    import tomllib
+except Exception:
+    sys.exit(2)
+try:
+    with open(sys.argv[1], "rb") as f:
+        data = tomllib.load(f)
+except Exception:
+    sys.exit(3)
+for entry in data.get("required_binaries", []) or []:
+    name = str(entry.get("name", "")).strip()
+    if name:
+        print(f"binary\t{name}")
+for entry in data.get("required_system_services", []) or []:
+    name = str(entry.get("name", "")).strip()
+    if name:
+        print(f"service\t{name}")
+verification = data.get("verification", {}) or {}
+for cmd in verification.get("commands", []) or []:
+    s = str(cmd).strip()
+    if s:
+        print(f"verify\t{s}")
+PY
+  )
+
+  if [ -z "${parsed}" ]; then
+    fail "could not parse ${PRIVILEGES_FILE}; check TOML syntax and python3 tomllib availability"
+  fi
+
+  # POSIX sh does not propagate variables out of a `while` in a pipe
+  # (the loop runs in a subshell). Intermediate state goes through a
+  # single mktemp file — one file per enforcement pass, removed on
+  # trap. The file is created with 0600 by mktemp; process-scoped.
+  STATE_FILE="$(mktemp -t evo-kiosk-preflight.XXXXXXXX)"
+  trap 'rm -f "${STATE_FILE}"' EXIT INT TERM
+
+  # First pass: required binaries. Any missing binary surfaces on the
+  # failure line so the operator can name-target `apt install`.
+  : > "${STATE_FILE}"
+  echo "${parsed}" | while IFS='	' read -r kind name; do
+    [ "${kind}" = "binary" ] || continue
+    if ! command -v "${name}" >/dev/null 2>&1; then
+      printf '%s ' "${name}" >> "${STATE_FILE}"
+    fi
+  done
+  missing_bins=$(sed 's/[[:space:]]*$//' "${STATE_FILE}")
+
+  if [ -n "${missing_bins}" ]; then
+    fail "required binaries missing from PATH: ${missing_bins} — install them (see host_provisioning.debian.apt_packages in ${PRIVILEGES_FILE})"
+  fi
+
+  # Second pass: services. `is-active` returns `active` or `activating`
+  # for a healthy unit; any other state (inactive / failed /
+  # not-found) is a hard refuse.
+  : > "${STATE_FILE}"
+  echo "${parsed}" | while IFS='	' read -r kind name; do
+    [ "${kind}" = "service" ] || continue
+    state=$(systemctl is-active "${name}" 2>/dev/null || true)
+    if [ "${state}" != "active" ] && [ "${state}" != "activating" ]; then
+      printf '%s(state=%s) ' "${name}" "${state:-unknown}" >> "${STATE_FILE}"
+    fi
+  done
+  missing_svcs=$(sed 's/[[:space:]]*$//' "${STATE_FILE}")
+
+  if [ -n "${missing_svcs}" ]; then
+    fail "required system services not active: ${missing_svcs}"
+  fi
+
+  # Third pass: verification commands. Each is observation-only.
+  : > "${STATE_FILE}"
+  echo "${parsed}" | while IFS='	' read -r kind rest; do
+    [ "${kind}" = "verify" ] || continue
+    if ! sh -c "${rest}" >/dev/null 2>&1; then
+      printf '%s\n' "${rest}" >> "${STATE_FILE}"
+    fi
+  done
+  failed_verify=$(cat "${STATE_FILE}")
+  if [ -n "${failed_verify}" ]; then
+    fail "verification commands failed: $(printf '%s' "${failed_verify}" | tr '\n' ';' | sed 's/;$//')"
+  fi
+
+  log "OS-dep enforcement clean: required binaries + services + verification all satisfied"
+}
+
+enforce_privileges
+
+# ------------------------------- Mint socket ------------------------
+#
+# Wait for the framework steward's kiosk mint socket. Check existence
+# only; do not open, mint, or log payload. Steward (evo.service) owns
+# the listen side. This also holds the unit's main start (labwc) until
+# the framework is up, which - together with After=evo-ui + the input
+# oneshots - keeps labwc from racing the DSI touchscreen seat setup on
+# the Pi 5 (a compositor-first experiment that moved this wait out started
+# labwc ~5s earlier and made touch acquisition intermittent). The
+# splash->compositor gap stays covered by the Plymouth deactivate handoff.
+i=0
+while [ "${i}" -lt "${SOCK_WAIT_SECS}" ]; do
+  if [ -S "${KIOSK_SOCK}" ] || [ -e "${KIOSK_SOCK}" ]; then
+    log "kiosk mint socket ready: ${KIOSK_SOCK}"
+    exit 0
+  fi
+  i=$((i + 1))
+  sleep 1
+done
+
+fail "kiosk mint socket missing after ${SOCK_WAIT_SECS}s: ${KIOSK_SOCK} (is evo.service up?)"

@@ -1,0 +1,279 @@
+#!/bin/sh
+# SPDX-License-Identifier: BUSL-1.1
+# evo-kiosk-session - labwc session command (Wayland client context).
+#
+# labwc spawns this script as its --session (-S) client after creating
+# its Wayland socket. By the time this script runs:
+#   - WAYLAND_DISPLAY is set (by labwc) -> Wayland clients can connect
+#   - XDG_RUNTIME_DIR is set (by pam_systemd) -> /run/user/<uid>/
+#
+# Responsibilities, in order:
+#   1. Apply Wayland output scale via wlr-randr if KIOSK_SCALE != "auto".
+#   2. Set the XKB layout for squeekboard via gsettings if KIOSK_OSK_LAYOUT
+#      is non-empty.
+#   3. Start the on-screen keyboard (squeekboard | wvkbd | none).
+#   4. If cursor=hide, fire HideCursor via wtype (F24 keybind in rc.xml).
+#   5. Optionally force the OSK visible for debugging (OSK_FORCE_SHOW).
+#   6. Exec the kiosk browser (/usr/local/bin/evo-kiosk-browser).
+#
+# Mint and cookie inject live in the browser binary only.
+# This script never opens /run/evo/kiosk.sock and never logs tokens.
+#
+# When the browser exits, this script exits, labwc exits (because it was
+# started with --session <this-script>), systemd restarts the whole unit.
+#
+# Environment variables expected from evo-kiosk-launch:
+#   KIOSK_URL         URL to load (resolved from overlay / TOML)
+#   OSK               "squeekboard" | "wvkbd" | "none"
+#   OSK_FORCE_SHOW    "true" | "false"
+#   KIOSK_CURSOR      "auto" | "show" | "hide"
+#   KIOSK_ZOOM        float or "auto"
+#   KIOSK_SCALE       float or "auto"
+#   KIOSK_ROT         "normal" | "90" | "180" | "270"
+#   KIOSK_OSK_LAYOUT  XKB code (us/gb/de/...) or empty
+
+set -eu
+
+KIOSK_URL="${KIOSK_URL:-http://127.0.0.1/}"
+OSK="${OSK:-squeekboard}"
+OSK_FORCE_SHOW="${OSK_FORCE_SHOW:-false}"
+KIOSK_CURSOR="${KIOSK_CURSOR:-auto}"
+KIOSK_ZOOM="${KIOSK_ZOOM:-auto}"
+KIOSK_SCALE="${KIOSK_SCALE:-auto}"
+KIOSK_ROT="${KIOSK_ROT:-normal}"
+KIOSK_OSK_LAYOUT="${KIOSK_OSK_LAYOUT:-}"
+
+log() {
+  printf '[kiosk-session] %s\n' "$*"
+}
+
+# ------------------ Output scale + rotation via wlr-randr ---------------
+
+# KIOSK_SCALE: "auto" -> omit --scale. KIOSK_ROT: "normal" -> omit --transform.
+# IMPORTANT: wlroots resets output transform when wlr-randr runs with only
+# --scale, so we must pass --transform in the same command whenever rotation
+# is non-normal.
+apply_output_layout() {
+  scale_auto=true
+  if [ "${KIOSK_SCALE}" != "auto" ] && [ -n "${KIOSK_SCALE}" ]; then
+    scale_auto=false
+  fi
+  rot_normal=true
+  case "${KIOSK_ROT}" in
+    normal|'') rot_normal=true ;;
+    90|180|270) rot_normal=false ;;
+    *) rot_normal=true ;;
+  esac
+  if ${scale_auto} && ${rot_normal}; then
+    return 0
+  fi
+  if ! command -v wlr-randr >/dev/null 2>&1; then
+    log "wlr-randr not installed; skipping layout (scale=${KIOSK_SCALE} rot=${KIOSK_ROT})"
+    return 0
+  fi
+  # Give labwc a moment to finish output bring-up; wlr-randr will fail
+  # with "compositor unavailable" otherwise on cold starts.
+  sleep 1
+  out=$(wlr-randr 2>/dev/null || true)
+  name=""
+  current=""
+  first_enabled=""
+  printf '%s\n' "${out}" | while IFS= read -r line; do
+    case "${line}" in
+      [!\ ]*)
+        current=$(printf '%s' "${line}" | awk '{print $1}')
+        ;;
+      *Enabled:\ yes*)
+        if [ -n "${current}" ] && [ -z "${first_enabled}" ]; then
+          first_enabled="${current}"
+          printf '%s' "${first_enabled}" > /tmp/.evo-kiosk-first-output.$$
+          break
+        fi
+        ;;
+    esac
+  done
+  if [ -f "/tmp/.evo-kiosk-first-output.$$" ]; then
+    name=$(cat "/tmp/.evo-kiosk-first-output.$$" 2>/dev/null || true)
+    rm -f "/tmp/.evo-kiosk-first-output.$$" 2>/dev/null || true
+  fi
+  if [ -z "${name}" ]; then
+    log "wlr-randr: no enabled output found; not applying layout"
+    return 0
+  fi
+  set -- wlr-randr --output "${name}"
+  if ! ${rot_normal}; then
+    set -- "$@" --transform "${KIOSK_ROT}"
+  fi
+  if ! ${scale_auto}; then
+    set -- "$@" --scale "${KIOSK_SCALE}"
+  fi
+  if "$@" 2>/dev/null; then
+    log "Applied wlr-randr output=${name} transform=${KIOSK_ROT} scale=${KIOSK_SCALE}"
+  else
+    log "wlr-randr failed (output=${name} transform=${KIOSK_ROT} scale=${KIOSK_SCALE}); continuing"
+  fi
+}
+
+apply_output_layout
+
+# --------------------- Live settings watcher -----------------------------
+#
+# Background daemon that reacts to overlay writes (display_rotation,
+# touch_rotation, touch_hflip, touch_vflip, legacy `rotation`) by
+# re-applying wlr-randr transform + regenerating the touch
+# calibration udev rule. Runs as a labwc client so its lifetime is
+# bound to the compositor session — labwc exits → this exits with it.
+#
+# MUST survive the later `exec evo-kiosk-browser`. A bare
+# `watch-settings &` is a job-control child of this shell; when the
+# shell is replaced by exec, dash/busybox send SIGHUP to those jobs
+# and the watcher dies silently. Remote Display & Touch then only
+# updates overlays (and root-side brightness/touch path units) —
+# display transform never re-applies until the operator restarts
+# evo-kiosk. `setsid -f` puts the watcher in its own session so it
+# is immune to that SIGHUP; labwc still reaps the tree when the
+# session unit stops (cgroup KillMode). Verified regression after
+# the 2026-08-07 fleet reinstall: overlays wrote, path units fired,
+# watcher absent from the process tree.
+if [ -x /usr/local/bin/evo-kiosk-watch-settings ]; then
+    _watch_log="${XDG_RUNTIME_DIR:-/tmp}/evo-kiosk-watch-settings.log"
+    _watch_pidfile="${XDG_RUNTIME_DIR:-/tmp}/evo-kiosk-watch-settings.pid"
+    # setsid puts the watcher outside labwc's process group, so a
+    # kiosk restart will not reap a prior instance — kill by pidfile
+    # + name before spawning or we stack live-apply daemons.
+    if [ -f "${_watch_pidfile}" ]; then
+        _old=$(cat "${_watch_pidfile}" 2>/dev/null || true)
+        if [ -n "${_old}" ] && kill -0 "${_old}" 2>/dev/null; then
+            kill "${_old}" 2>/dev/null || true
+            wait "${_old}" 2>/dev/null || true
+        fi
+        rm -f "${_watch_pidfile}"
+    fi
+    # Match the real argv (`/bin/sh /usr/local/bin/evo-kiosk-watch-settings`);
+    # do not use pkill -x — that requires an exact cmdline match and
+    # misses the /bin/sh wrapper.
+    pkill -f '/usr/local/bin/evo-kiosk-watch-settings' 2>/dev/null || true
+    sleep 0.2
+    if command -v setsid >/dev/null 2>&1; then
+        setsid -f /usr/local/bin/evo-kiosk-watch-settings \
+            >>"${_watch_log}" 2>&1
+    else
+        # Fallback: ignore SIGHUP in a subshell before exec'ing the
+        # watcher so the same immunity holds without setsid.
+        (
+            trap '' HUP
+            exec /usr/local/bin/evo-kiosk-watch-settings
+        ) >>"${_watch_log}" 2>&1 &
+    fi
+    # Best-effort pid capture after setsid -f reparents.
+    sleep 0.1
+    _watch_pid=$(pgrep -n -f '/usr/local/bin/evo-kiosk-watch-settings' 2>/dev/null || true)
+    if [ -n "${_watch_pid}" ]; then
+        printf '%s' "${_watch_pid}" > "${_watch_pidfile}"
+    fi
+    log "Started evo-kiosk-watch-settings pid=${_watch_pid:-?} (log=${_watch_log})"
+fi
+
+# --------------------- OSK XKB layout via gsettings ----------------------
+
+apply_osk_layout() {
+  if [ -z "${KIOSK_OSK_LAYOUT}" ]; then
+    return 0
+  fi
+  if ! command -v gsettings >/dev/null 2>&1; then
+    log "gsettings not installed; skipping osk_layout=${KIOSK_OSK_LAYOUT}"
+    return 0
+  fi
+  gsettings set org.gnome.desktop.input-sources sources "[('xkb', '${KIOSK_OSK_LAYOUT}')]" 2>/dev/null || true
+  log "OSK layout: gsettings input-sources.sources -> [('xkb', '${KIOSK_OSK_LAYOUT}')]"
+}
+
+apply_osk_layout
+
+# --------------------------- OSK startup ---------------------------------
+
+start_squeekboard() {
+  # Theme apply + squeekboard spawn are owned by
+  # /usr/local/bin/evo-kiosk-osk-theme so the boot path and the
+  # live-refresh path (evo-kiosk-watch-settings on OSK publish
+  # record change) execute the same code. The helper resolves the
+  # active UI theme, installs the pack CSS at $HOME/.config/gtk-3.0/
+  # gtk.css, computes the GTK_THEME base (Adwaita for `air`,
+  # Adwaita:dark for evo-default/night-sky/sunrise/liquid), and
+  # spawns squeekboard with that env. See docs/KIOSK.md § "OSK
+  # theming" for the full contract with the UI team.
+  if [ -x /usr/local/bin/evo-kiosk-osk-theme ]; then
+    /usr/local/bin/evo-kiosk-osk-theme || log "WARN: evo-kiosk-osk-theme returned non-zero; OSK may be absent"
+  else
+    log "WARN: /usr/local/bin/evo-kiosk-osk-theme missing; falling back to stock squeekboard"
+    if command -v squeekboard >/dev/null 2>&1; then
+      if command -v gsettings >/dev/null 2>&1; then
+        gsettings set org.gnome.desktop.a11y.applications screen-keyboard-enabled true 2>/dev/null || true
+      fi
+      # Same exec-SIGHUP class as watch-settings — keep OSK alive
+      # after this script is replaced by the browser.
+      if command -v setsid >/dev/null 2>&1; then
+        setsid -f squeekboard
+      else
+        ( trap '' HUP; exec squeekboard ) &
+      fi
+      log "Started stock squeekboard"
+    else
+      log "squeekboard not installed; skipping OSK"
+    fi
+  fi
+}
+
+start_wvkbd() {
+  _start_detached() {
+    if command -v setsid >/dev/null 2>&1; then
+      setsid -f "$@"
+    else
+      ( trap '' HUP; exec "$@" ) &
+    fi
+  }
+  if command -v wvkbd-mobintl >/dev/null 2>&1; then
+    _start_detached wvkbd-mobintl -L 280
+    log "Started wvkbd-mobintl"
+  elif command -v wvkbd >/dev/null 2>&1; then
+    _start_detached wvkbd -L 280
+    log "Started wvkbd"
+  else
+    log "wvkbd not installed; skipping OSK"
+  fi
+}
+
+case "${OSK}" in
+  squeekboard) start_squeekboard ;;
+  wvkbd)       start_wvkbd ;;
+  none)        log "OSK disabled by config" ;;
+  *)           log "Unknown osk='${OSK}'; defaulting to squeekboard"; start_squeekboard ;;
+esac
+
+# --------------------------- Cursor hide ---------------------------------
+
+# When operator sets cursor=hide, fire labwc's HideCursor action via wtype.
+# F24 is bound to HideCursor in /etc/evo/labwc/rc.xml.
+if [ "${KIOSK_CURSOR}" = "hide" ] && command -v wtype >/dev/null 2>&1; then
+  (
+    sleep 1
+    wtype -P F24 2>/dev/null || true
+  ) &
+  log "Scheduled HideCursor keybind (KIOSK_CURSOR=hide)"
+fi
+
+if [ "${OSK_FORCE_SHOW}" = "true" ] && [ "${OSK}" = "squeekboard" ] && command -v busctl >/dev/null 2>&1; then
+  (
+    sleep 2
+    busctl call --user sm.puri.OSK0 /sm/puri/OSK0 sm.puri.OSK0 SetVisible b true 2>/dev/null || true
+  ) &
+  log "Scheduled squeekboard SetVisible true (OSK_FORCE_SHOW=true)"
+fi
+
+# --------------------------- Exec browser --------------------------------
+
+# Mint + cookie inject are owned by the browser binary.
+# KIOSK_ZOOM is consumed via getenv; CLI is URL-only.
+log "[handoff] browser load ${KIOSK_URL} (zoom=${KIOSK_ZOOM})"
+export KIOSK_ZOOM
+exec /usr/local/bin/evo-kiosk-browser "${KIOSK_URL}"

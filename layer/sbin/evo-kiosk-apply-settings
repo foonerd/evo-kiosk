@@ -1,0 +1,125 @@
+#!/bin/sh
+# SPDX-License-Identifier: BUSL-1.1
+#
+# evo-kiosk-apply-settings — apply the kiosk operator settings
+# that require root: currently just brightness (sysfs write to
+# backlight).
+#
+# Sleep-related overlays (sleep_timeout_seconds,
+# sleep_inhibit_while_playing, sleep_inhibit_active) are handled
+# on the session side by evo-kiosk-watch-settings, which manages
+# a swayidle child process bound to the labwc session. swayidle
+# needs WAYLAND_DISPLAY + XDG_RUNTIME_DIR to talk to the compositor
+# via the wlr-output-power-management-v1 protocol; those are only
+# set inside the kiosk user's session, so this root-side script
+# does not touch that path.
+#
+# Fired by the systemd path unit `evo-kiosk-apply-settings.path`
+# on any change to the brightness overlay:
+#   /var/lib/evo/settings/kiosk/brightness
+#
+# Runs as root. The kiosk unit runs as an unprivileged compositor
+# user; overlay writes come from the local WebKit-handler path
+# (kiosk-browser) or the remote WS plugin
+# (org.evoframework.system.kiosk). Both paths land at the same
+# overlay files.
+#
+# Idempotent: same overlay values → same sysfs bytes → no-op.
+# Safe to re-run.
+
+set -eu
+
+SETTINGS_DIR=/var/lib/evo/settings/kiosk
+
+log() {
+    printf '[kiosk-apply] %s\n' "$*" >&2
+}
+
+# Read a single-line overlay file, falling back to $2 if absent
+# or blank. Never fails.
+_read_overlay() {
+    _file="${SETTINGS_DIR}/$1"
+    _default="$2"
+    if [ -r "${_file}" ]; then
+        _v=$(head -1 "${_file}" 2>/dev/null | tr -d '\r\n' || true)
+        if [ -n "${_v}" ]; then
+            printf '%s' "${_v}"
+            return
+        fi
+    fi
+    printf '%s' "${_default}"
+}
+
+# ----------------------- brightness apply -----------------------
+#
+# Auto-discover backlight: enumerate /sys/class/backlight/*, take
+# the first entry whose associated output is enabled. Single-panel
+# device (99% of deployments including the Pi 5 DSI) hits the
+# only candidate. Multi-panel devices pick the primary. Absent
+# backlight (headless install, HDMI-only monitor with no
+# backlight control) logs and no-ops.
+apply_brightness() {
+    _pct=$(_read_overlay brightness "")
+    if [ -z "${_pct}" ]; then
+        return 0
+    fi
+    if ! echo "${_pct}" | grep -qE '^[0-9]+$'; then
+        log "brightness overlay '${_pct}' not a non-negative integer; skipping"
+        return 0
+    fi
+    if [ "${_pct}" -gt 100 ]; then
+        log "brightness overlay ${_pct} > 100; clamping"
+        _pct=100
+    fi
+    # Floor at 5% so the screen never blacks out entirely — the
+    # UI's "raise brightness" control has to remain visible for
+    # an operator to recover.
+    if [ "${_pct}" -lt 5 ]; then
+        _pct=5
+    fi
+
+    _bl_dir=""
+    for _cand in /sys/class/backlight/*; do
+        [ -d "${_cand}" ] || continue
+        _bl_dir="${_cand}"
+        break
+    done
+    if [ -z "${_bl_dir}" ]; then
+        log "no backlight device under /sys/class/backlight/; brightness overlay ${_pct}% not applied"
+        return 0
+    fi
+
+    _max=$(cat "${_bl_dir}/max_brightness" 2>/dev/null || echo 0)
+    if [ "${_max}" -le 0 ]; then
+        log "backlight ${_bl_dir} reports max_brightness=${_max}; skipping"
+        return 0
+    fi
+    # Rounded map: percent × max / 100.
+    _raw=$(( _pct * _max / 100 ))
+    if [ "${_raw}" -lt 1 ]; then
+        _raw=1
+    fi
+
+    # Idempotence check. The paired `.path` unit watches the whole
+    # settings/kiosk/ directory (see evo-kiosk-apply-settings.path
+    # for why that is required), so this service also fires on
+    # unrelated overlay writes (touch_*, sleep_*, calibrate_
+    # trigger). Read the current raw brightness from sysfs; if it
+    # already matches the intended value, skip the write. This
+    # keeps the backlight from any flicker on unrelated fires.
+    _current=$(cat "${_bl_dir}/brightness" 2>/dev/null || echo -1)
+    if [ "${_current}" = "${_raw}" ]; then
+        log "brightness no-op (${_pct}% = ${_raw}/${_max} already set on $(basename "${_bl_dir}"))"
+        return 0
+    fi
+
+    if echo "${_raw}" > "${_bl_dir}/brightness" 2>/dev/null; then
+        log "brightness → ${_pct}% (${_raw}/${_max}) on $(basename "${_bl_dir}")"
+    else
+        log "WARN: failed to write ${_bl_dir}/brightness"
+    fi
+}
+
+# ----------------------- entry point ----------------------------
+
+apply_brightness

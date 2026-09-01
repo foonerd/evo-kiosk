@@ -1,0 +1,297 @@
+#!/bin/sh
+# SPDX-License-Identifier: BUSL-1.1
+# evo-kiosk-touch-calibrate — compose an LIBINPUT_CALIBRATION_MATRIX
+# for the on-device touchscreen and install it as a udev rule.
+#
+# The rotation of a touch panel is independent of the compositor's
+# display rotation. Manufacturer default, kernel-reported orientation,
+# and the actual physical mount can all disagree; vendor quirks
+# elsewhere in the stack compensate on an ad-hoc basis. The kiosk
+# owns this compensation explicitly so an operator can tune it via
+# the UI without editing the OS.
+#
+# Inputs — two invocation shapes:
+#
+#   Explicit args (used by the wizard + manual tests):
+#     $1  rotation  0 | 90 | 180 | 270           (CCW)
+#     $2  hflip     true | false                  (post-rotation, output X-axis)
+#     $3  vflip     true | false                  (post-rotation, output Y-axis)
+#
+#   No args (used by the systemd path-triggered service):
+#     Reads /var/lib/evo/settings/kiosk/touch_rotation,
+#           /var/lib/evo/settings/kiosk/touch_hflip,
+#           /var/lib/evo/settings/kiosk/touch_vflip
+#     Falls back to legacy /var/lib/evo/settings/kiosk/rotation
+#     for touch_rotation when the decoupled overlay is missing.
+#     Missing hflip/vflip defaults to false.
+#
+# Effect:
+#   - Composes a 6-value 2×3 affine matrix
+#   - Writes /etc/udev/rules.d/99-evo-kiosk-touch-rotation.rules
+#     targeting ENV{ID_INPUT_TOUCHSCREEN}=="1" so every attached
+#     touchscreen (Goodix on the DSI panel, HDMI touchscreens,
+#     external USB touch monitors) picks it up
+#   - Reloads udev rules and triggers a re-detect on input devices
+#     so the change is live without unplug/replug
+#
+# Exit codes:
+#   0  matrix composed + rule installed + udev reloaded
+#   1  invalid arguments
+#   2  cannot write udev rule (permissions)
+#   3  udev reload failed
+#
+# The composed matrix is the linear map from device-native normalised
+# coordinates ((0,0) top-left of the touch panel as reported by the
+# kernel driver) to output-space normalised coordinates ((0,0)
+# top-left of the compositor's post-transform output).
+
+set -eu
+
+SETTINGS_DIR="${KIOSK_SETTINGS_DIR:-/var/lib/evo/settings/kiosk}"
+
+# Burst-coalesce window. `evo-kiosk-config::set_touch_calibration`
+# writes three overlay files back-to-back (`touch_rotation`,
+# `touch_hflip`, `touch_vflip`) via three separate atomic renames.
+# The paired `.path` unit watches the directory and fires on the
+# first `MOVED_TO`; the following two writes queue a follow-up
+# run in systemd's transaction. Sleeping ~150 ms at start lets the
+# whole burst land before we read overlays — the first invocation
+# reads a fully-consistent state and applies once; the queued
+# follow-up reads the same state and short-circuits to a no-op
+# via the matrix-compare below. Net effect: exactly ONE unbind /
+# bind cycle per operator update, not up to three. Adjustable
+# via KIOSK_TOUCH_CALIBRATE_SETTLE_MS.
+SETTLE_MS="${KIOSK_TOUCH_CALIBRATE_SETTLE_MS:-250}"
+# Only sleep when invoked without explicit args (i.e. from the
+# systemd path-triggered service). Direct CLI invocations from the
+# wizard should apply immediately.
+if [ $# -eq 0 ] && [ "${SETTLE_MS}" -gt 0 ] 2>/dev/null; then
+    sleep "0.$(printf '%03d' "${SETTLE_MS}")"
+fi
+
+# Read a single-line overlay file; fall back to $2 if unreadable or blank.
+_read_overlay() {
+    _file="${SETTINGS_DIR}/$1"
+    if [ -r "${_file}" ]; then
+        _v=$(head -1 "${_file}" 2>/dev/null | tr -d '\r\n' || true)
+        if [ -n "${_v}" ]; then
+            printf '%s' "${_v}"
+            return
+        fi
+    fi
+    printf '%s' "$2"
+}
+
+if [ $# -eq 0 ]; then
+    # No-args mode — used by the systemd path-triggered service.
+    # Read overlay files directly; honour the legacy `rotation`
+    # overlay when the decoupled `touch_rotation` is absent so a
+    # first-touch install with a single-axis config keeps working.
+    ROTATION=$(_read_overlay touch_rotation "$(_read_overlay rotation 0)")
+    HFLIP=$(_read_overlay touch_hflip false)
+    VFLIP=$(_read_overlay touch_vflip false)
+else
+    ROTATION="${1:-0}"
+    HFLIP="${2:-false}"
+    VFLIP="${3:-false}"
+fi
+
+case "${ROTATION}" in
+    0|90|180|270) : ;;
+    normal) ROTATION=0 ;;
+    *)
+        echo "[touch-calibrate] ERROR: invalid rotation '${ROTATION}' (expected 0|90|180|270)" >&2
+        exit 1
+        ;;
+esac
+
+case "${HFLIP}" in
+    true|false) : ;;
+    *)
+        echo "[touch-calibrate] ERROR: invalid hflip '${HFLIP}' (expected true|false)" >&2
+        exit 1
+        ;;
+esac
+
+case "${VFLIP}" in
+    true|false) : ;;
+    *)
+        echo "[touch-calibrate] ERROR: invalid vflip '${VFLIP}' (expected true|false)" >&2
+        exit 1
+        ;;
+esac
+
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "[touch-calibrate] ERROR: python3 required for matrix composition" >&2
+    exit 1
+fi
+
+MATRIX=$(python3 - "${ROTATION}" "${HFLIP}" "${VFLIP}" <<'PY'
+# 2×3 affine matrices as (a, b, c, d, e, f) meaning
+#   x_out = a*x_in + b*y_in + c
+#   y_out = d*x_in + e*y_in + f
+# Coordinates are normalised (0..1) touch device native → output.
+import sys
+
+IDENT = (1, 0, 0, 0, 1, 0)
+# ROT_90: 90° counter-clockwise. Verified against volumio-os
+# install-kiosk-wpe.sh matrix table and confirmed empirically on
+# the reference DSI panel — see the on-target evidence in the
+# commit history.
+ROT_90 = (0, 1, 0, -1, 0, 1)
+ROT_180 = (-1, 0, 1, 0, -1, 1)
+ROT_270 = (0, -1, 1, 1, 0, 0)
+# Flips operate on the post-rotation output space: hflip mirrors
+# the output X-axis (tap-left → registers-right); vflip mirrors Y.
+HFLIP = (-1, 0, 1, 0, 1, 0)
+VFLIP = (1, 0, 0, 0, -1, 1)
+
+
+def compose(a, b):
+    """Return the 2×3 affine A * B (both extended with (0,0,1) row)."""
+    (aa, ab, ac, ad, ae, af) = a
+    (ba, bb, bc, bd, be, bf) = b
+    return (
+        aa * ba + ab * bd, aa * bb + ab * be, aa * bc + ab * bf + ac,
+        ad * ba + ae * bd, ad * bb + ae * be, ad * bc + ae * bf + af,
+    )
+
+
+rotation = sys.argv[1]
+hflip = sys.argv[2] == "true"
+vflip = sys.argv[3] == "true"
+
+rot = {"0": IDENT, "90": ROT_90, "180": ROT_180, "270": ROT_270}[rotation]
+m = rot
+if hflip:
+    m = compose(HFLIP, m)
+if vflip:
+    m = compose(VFLIP, m)
+
+# libinput accepts integers and floats; keep integer form when the
+# entry is a whole number so the udev rule reads cleanly in `udevadm
+# info`. All rotation × flip combinations produce integer entries in
+# {-1, 0, 1}.
+def fmt(v):
+    return str(int(v)) if float(v).is_integer() else f"{v:.6g}"
+
+print(" ".join(fmt(v) for v in m))
+PY
+)
+
+if [ -z "${MATRIX}" ]; then
+    echo "[touch-calibrate] ERROR: matrix composition returned empty" >&2
+    exit 1
+fi
+
+UDEV_RULE=/etc/udev/rules.d/99-evo-kiosk-touch-rotation.rules
+
+# Idempotence check. The paired `.path` unit watches the whole
+# settings/kiosk/ directory (see evo-kiosk-touch-calibrate.path for
+# why that is required), so this service also fires on unrelated
+# overlay writes (brightness, sleep_*, calibrate_trigger). Compose
+# the intended matrix line, compare it against the current rule
+# file; if identical, exit 0 without a reload, unbind, or bind.
+# This makes operator-invisible sanity for any unrelated fire and
+# collapses the three-file `set_touch_calibration` burst (settled
+# above) into a single udev cycle.
+INTENDED_LINE="ENV{ID_INPUT_TOUCHSCREEN}==\"1\", ENV{LIBINPUT_CALIBRATION_MATRIX}=\"${MATRIX}\""
+if [ -r "${UDEV_RULE}" ] && grep -Fxq "${INTENDED_LINE}" "${UDEV_RULE}"; then
+    echo "[touch-calibrate] no-op (rotation=${ROTATION} hflip=${HFLIP} vflip=${VFLIP} matrix='${MATRIX}' already applied)"
+    exit 0
+fi
+
+tmp=$(mktemp) || {
+    echo "[touch-calibrate] ERROR: mktemp failed" >&2
+    exit 2
+}
+cat > "${tmp}" <<EOF
+# evo-kiosk touchscreen calibration — generated by
+# /usr/local/sbin/evo-kiosk-touch-calibrate. Do not edit by hand;
+# change /var/lib/evo/settings/kiosk/touch_{rotation,hflip,vflip}
+# overlays instead. Applies to every touchscreen device (matched
+# by the ID_INPUT_TOUCHSCREEN udev property) so external touch
+# monitors get the same calibration as the built-in DSI panel.
+${INTENDED_LINE}
+EOF
+
+if ! mv "${tmp}" "${UDEV_RULE}"; then
+    rm -f "${tmp}"
+    echo "[touch-calibrate] ERROR: cannot write ${UDEV_RULE} (need root)" >&2
+    exit 2
+fi
+chmod 0644 "${UDEV_RULE}"
+
+# Reload rules so a subsequent driver-rebind sees the new
+# LIBINPUT_CALIBRATION_MATRIX property.
+if ! udevadm control --reload-rules 2>/dev/null; then
+    echo "[touch-calibrate] ERROR: udevadm control --reload-rules failed" >&2
+    exit 3
+fi
+
+# Force each touchscreen's kernel driver to re-create the input
+# device.
+#
+# `udevadm trigger --action=change` is NOT sufficient — libinput
+# reads LIBINPUT_CALIBRATION_MATRIX only when it OPENS an input
+# device (add-time), and a change uevent does not tear the
+# device down. The matrix updates in udev's database but the
+# running compositor keeps the calibration it captured at
+# device-add time. Verified on the DSI Goodix panel: after a
+# change-trigger, /proc/…/status of libinput showed the old
+# calibration; after driver unbind+bind, the kernel destroyed
+# and re-created the input device (new inputN + new eventN),
+# libinput saw a fresh add, and the calibration took.
+#
+# This block walks each ID_INPUT_TOUCHSCREEN=1 device up its
+# sysfs path to the first ancestor with a `driver` symlink,
+# reads the driver dir + the ancestor's basename (the bus-
+# specific device slot: `10-005d` on I2C, `1-1.4:1.0` on USB,
+# etc.), then writes the slot to the driver's unbind + bind
+# attributes. Works across bus types because it uses only the
+# generic kernel `driver` binding convention. Brief (~1 s)
+# touch interruption on apply is expected and fine; the mount-
+# on-play flow already handles input-device transient absence.
+retrigger_touchscreens() {
+    _rt_any=0
+    for _rt_evt in /dev/input/event*; do
+        [ -e "${_rt_evt}" ] || continue
+        udevadm info -q property -n "${_rt_evt}" 2>/dev/null \
+            | grep -q '^ID_INPUT_TOUCHSCREEN=1$' || continue
+        _rt_syspath=$(udevadm info -q path -n "${_rt_evt}" 2>/dev/null)
+        [ -n "${_rt_syspath}" ] || continue
+        _rt_dev="/sys${_rt_syspath}"
+        # Walk up until we find a driver anchor or hit /sys.
+        while [ -n "${_rt_dev}" ] && [ "${_rt_dev}" != "/sys" ] \
+                && [ ! -L "${_rt_dev}/driver" ]; do
+            _rt_dev=$(dirname "${_rt_dev}")
+        done
+        if [ ! -L "${_rt_dev}/driver" ]; then
+            echo "[touch-calibrate] WARN: no driver anchor for ${_rt_evt}; skipping rebind" >&2
+            continue
+        fi
+        _rt_driver=$(readlink -f "${_rt_dev}/driver")
+        _rt_slot=$(basename "${_rt_dev}")
+        if ! echo "${_rt_slot}" > "${_rt_driver}/unbind" 2>/dev/null; then
+            echo "[touch-calibrate] WARN: unbind ${_rt_slot} at ${_rt_driver} failed" >&2
+            continue
+        fi
+        if ! echo "${_rt_slot}" > "${_rt_driver}/bind" 2>/dev/null; then
+            echo "[touch-calibrate] ERROR: bind ${_rt_slot} at ${_rt_driver} failed — device left unbound" >&2
+            # Try once more; some drivers race on rapid cycles.
+            sleep 0.2
+            if ! echo "${_rt_slot}" > "${_rt_driver}/bind" 2>/dev/null; then
+                echo "[touch-calibrate] ERROR: second bind attempt also failed" >&2
+                exit 3
+            fi
+        fi
+        echo "[touch-calibrate] rebound touchscreen driver=${_rt_driver##*/drivers/} slot=${_rt_slot}"
+        _rt_any=1
+    done
+    if [ "${_rt_any}" -eq 0 ]; then
+        echo "[touch-calibrate] no touchscreen (ID_INPUT_TOUCHSCREEN=1) found; udev rule installed but no live device to re-add" >&2
+    fi
+}
+retrigger_touchscreens
+
+echo "[touch-calibrate] applied rotation=${ROTATION} hflip=${HFLIP} vflip=${VFLIP} matrix='${MATRIX}'"

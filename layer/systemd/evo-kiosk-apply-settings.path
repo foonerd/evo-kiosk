@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: BUSL-1.1
+#
+# Fires evo-kiosk-apply-settings.service whenever any file under
+# /var/lib/evo/settings/kiosk/ changes. Sleep-related overlays
+# (sleep_timeout_seconds, sleep_inhibit_while_playing,
+# sleep_inhibit_active) are handled on the session side by
+# evo-kiosk-watch-settings (which manages a swayidle child bound
+# to the labwc Wayland session); the root-side .service here
+# owns brightness only.
+#
+# WATCH TARGET IS THE DIRECTORY, NOT A FILE. A `PathModified=<file>`
+# directive arms an inotify watch on the FILE INODE.
+# `evo-kiosk-config::write_overlay_atomic` writes to <path>.tmp
+# and then `rename(2)`s over <path> — POSIX unlinks the old
+# inode. systemd's watch, still on the old inode, receives
+# IN_DELETE_SELF (not one of PathModified's trigger events) and
+# the new inode at the same path is unwatched. Result: only the
+# first atomic write after unit start fires; every subsequent one
+# is invisible. Verified on .24 with an inotifywait probe.
+#
+# PathChanged on the parent DIRECTORY watches the dir's inode
+# with IN_CLOSE_WRITE | IN_MOVED_TO on child entries. The
+# MOVED_TO event that lands on the target filename during
+# rename-over IS caught. Same pattern the session-side
+# evo-kiosk-watch-settings uses for the OSK-theme settings.json
+# trigger — one lesson, applied everywhere it matters.
+#
+# The paired .service is idempotent (reads the current raw
+# backlight value from sysfs, compares against the intended
+# value derived from the brightness overlay, and skips the
+# sysfs write when they already match), so directory-level
+# firing on unrelated overlays (touch_*, sleep_*, calibrate_
+# trigger) produces no operator-visible artifact — no backlight
+# flicker.
+
+[Unit]
+Description=evo kiosk operator-settings overlay watcher
+
+[Path]
+PathChanged=/var/lib/evo/settings/kiosk/
+Unit=evo-kiosk-apply-settings.service
+
+[Install]
+WantedBy=multi-user.target
