@@ -12,7 +12,8 @@
 #   2. Set the XKB layout for squeekboard via gsettings if KIOSK_OSK_LAYOUT
 #      is non-empty.
 #   3. Start the on-screen keyboard (squeekboard | wvkbd | none).
-#   4. If cursor=hide, fire HideCursor via wtype (F24 keybind in rc.xml).
+#   4. (Pointer visibility is applied by evo-kiosk-launch via the
+#      cursor theme, before this script runs.)
 #   5. Optionally force the OSK visible for debugging (OSK_FORCE_SHOW).
 #   6. Exec the kiosk browser (/usr/local/bin/evo-kiosk-browser).
 #
@@ -251,16 +252,16 @@ case "${OSK}" in
 esac
 
 # --------------------------- Cursor hide ---------------------------------
-
-# When operator sets cursor=hide, fire labwc's HideCursor action via wtype.
-# F24 is bound to HideCursor in /etc/evo/labwc/rc.xml.
-if [ "${KIOSK_CURSOR}" = "hide" ] && command -v wtype >/dev/null 2>&1; then
-  (
-    sleep 1
-    wtype -P F24 2>/dev/null || true
-  ) &
-  log "Scheduled HideCursor keybind (KIOSK_CURSOR=hide)"
-fi
+#
+# Nothing to do here. Pointer visibility is applied by
+# evo-kiosk-launch, which selects a transparent cursor theme before
+# the compositor starts.
+#
+# This used to fire labwc's HideCursor through a synthetic F24. That
+# could not hold: labwc restores the cursor on the next pointer
+# action, so the pointer came back the moment a mouse moved, and on
+# labwc 0.8.3 the action does not exist at all. KIOSK_CURSOR is still
+# exported for diagnostics and is not consumed here.
 
 if [ "${OSK_FORCE_SHOW}" = "true" ] && [ "${OSK}" = "squeekboard" ] && command -v busctl >/dev/null 2>&1; then
   (

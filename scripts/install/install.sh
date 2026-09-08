@@ -331,6 +331,22 @@ install_labwc_config() {
   log "Installed ${dst}"
 }
 
+install_cursor_theme() {
+  # The transparent cursor theme the launcher selects when the operator
+  # has hidden the pointer. Installed as a whole tree: one real Xcursor
+  # file plus a symlink per cursor name, so a name the compositor asks
+  # for cannot fall through to another theme and reappear as a visible
+  # pointer.
+  local src="${LAYER_DIR}/share/icons/evo-blank"
+  local dst="/usr/share/icons/evo-blank"
+  [[ -d "${src}" ]] || fail "Missing cursor theme ${src}"
+  rm -rf "${dst}"
+  mkdir -p "$(dirname "${dst}")"
+  cp -a "${src}" "${dst}"
+  chmod -R a+rX "${dst}"
+  log "Installed ${dst} ($(find "${dst}/cursors" -mindepth 1 | wc -l) cursor names)"
+}
+
 install_unit() {
   local src="${LAYER_DIR}/systemd/evo-kiosk.service"
   local dst="/etc/systemd/system/evo-kiosk.service"
@@ -547,6 +563,7 @@ main() {
   install_helper_scripts
   install_kiosk_apply_units
   install_labwc_config
+  install_cursor_theme
   install_unit
   ensure_settings_dir
   ensure_etc_kiosk_toml

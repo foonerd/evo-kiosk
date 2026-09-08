@@ -35,6 +35,31 @@ log() {
   printf '[kiosk-launch] %s\n' "$*"
 }
 
+# --------------------------- cursor policy -----------------------------
+#
+# Pointer visibility is applied here, at session start, by choosing the
+# cursor theme labwc loads. It is not a live control and nothing
+# revisits it while the session runs.
+#
+# labwc's HideCursor is not usable for this. Its own manual states the
+# cursor returns on the next pointer action, so on a seat with a mouse
+# it cannot hold; on labwc 0.8.3 the action does not exist at all and
+# the keybind is rejected outright. A theme whose every cursor is
+# transparent has nothing to reveal — the pointer still moves, hovers
+# and clicks, and draws no pixels — and it behaves the same on both
+# labwc versions in the field.
+#
+# Prints the theme name to use, or nothing when the stock theme should
+# be left alone.
+KIOSK_BLANK_CURSOR_THEME="${KIOSK_BLANK_CURSOR_THEME:-evo-blank}"
+
+cursor_theme_for() {
+  case "$1" in
+    hide) printf '%s' "${KIOSK_BLANK_CURSOR_THEME}" ;;
+    *)    printf '' ;;
+  esac
+}
+
 # ------------------------------ TOML read ------------------------------
 
 # Minimal TOML accessor using python3 tomllib if available, else a sed-based
@@ -105,8 +130,21 @@ resolve() {
   printf '%s' "${v}"
 }
 
+# Test seam: let a harness source this script for its pure helpers
+# without probing DRM, waiting on the socket, or execing a compositor.
+# Never set on a device.
+if [ "${EVO_KIOSK_LAUNCH_LIB_ONLY:-0}" = "1" ]; then
+    # `return` succeeds when sourced (the harness case) and fails when
+    # executed, where the fallback exits instead.
+    # shellcheck disable=SC2317
+    return 0 2>/dev/null || exit 0
+fi
+
 OSK=$(resolve osk osk squeekboard)
 CURSOR=$(resolve cursor cursor auto)
+# Resolved here rather than at the export below so the startup log
+# line reports the theme actually chosen, not a placeholder.
+_cursor_theme=$(cursor_theme_for "${CURSOR}")
 OSK_FORCE_SHOW=$(resolve osk_force_show osk_force_show false)
 AUTO_ROTATE=$(resolve auto_rotate auto_rotate false)
 XKB_LAYOUT=$(resolve xkb_layout xkb_layout us)
@@ -168,7 +206,7 @@ if [ -n "${URL_FROM_TOML}" ]; then
   KIOSK_URL="${URL_FROM_TOML}"
 fi
 
-log "url=${KIOSK_URL} output=${KIOSK_OUTPUT:-<first>} display_rot=${WLR_ROT} touch_rot=${TOUCH_ROT} touch_hflip=${TOUCH_HFLIP} touch_vflip=${TOUCH_VFLIP} osk=${OSK} cursor=${CURSOR} auto_rotate=${AUTO_ROTATE} zoom=${KIOSK_ZOOM} scale=${KIOSK_SCALE} osk_layout=${KIOSK_OSK_LAYOUT}"
+log "url=${KIOSK_URL} output=${KIOSK_OUTPUT:-<first>} display_rot=${WLR_ROT} touch_rot=${TOUCH_ROT} touch_hflip=${TOUCH_HFLIP} touch_vflip=${TOUCH_VFLIP} osk=${OSK} cursor=${CURSOR} cursor_theme=${_cursor_theme:-<stock>} auto_rotate=${AUTO_ROTATE} zoom=${KIOSK_ZOOM} scale=${KIOSK_SCALE} osk_layout=${KIOSK_OSK_LAYOUT}"
 
 # ---------------------------- Compositor environment ----------------------
 
@@ -198,6 +236,15 @@ export KIOSK_URL
 export OSK
 export OSK_FORCE_SHOW
 export KIOSK_CURSOR="${CURSOR}"
+# Pointer visibility. `hide` selects the transparent theme; every other
+# policy leaves the stock theme in place. Unset rather than merely
+# skipped, so a value inherited from the unit environment cannot leak a
+# blank pointer into a session the operator asked to show one.
+if [ -n "${_cursor_theme}" ]; then
+  export XCURSOR_THEME="${_cursor_theme}"
+else
+  unset XCURSOR_THEME || true
+fi
 export KIOSK_ZOOM
 export KIOSK_SCALE
 export KIOSK_OSK_LAYOUT

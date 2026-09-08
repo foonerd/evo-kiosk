@@ -20,6 +20,8 @@ thiserror = "2"
 
 [dev-dependencies]
 # serde_json is used only to lock the `DisplayState` wire shape
-# in a unit test; not compiled into the shipped crate. Fixture-
-# free — no filesystem or network needed for any test.
+# in a unit test; not compiled into the shipped crate. The overlay
+# round-trip tests write to a scratch directory under the system
+# temp dir (via `KIOSK_SETTINGS_DIR`) and clean up after
+# themselves; no network, and nothing outside the temp tree.
 serde_json = "1"

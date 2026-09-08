@@ -175,16 +175,112 @@ apply_sleep() {
     log "sleep armed: swayidle pid=${new_pid} timeout=${effective}s (base=${base}s, inhibit_toggle=${inhibit_toggle}, inhibit_active=${inhibit_active})"
 }
 
+# ----------------------------- OSK apply ------------------------------
+#
+# The on-screen keyboard is a Wayland client, not a compositor
+# setting, so turning it on or off is a process-lifecycle question:
+# start one, or kill the one that is running. There is no keybind
+# and no compositor reload involved.
+#
+# Theme resolution and the actual spawn stay owned by
+# evo-kiosk-osk-theme so the boot path and this live path produce
+# an identically themed keyboard. This function decides only
+# whether an OSK should be running at all.
+
+OSK_THEME_BIN="${EVO_KIOSK_OSK_THEME:-/usr/local/bin/evo-kiosk-osk-theme}"
+
+# Same pidfile evo-kiosk-osk-theme records its spawn in — the two
+# scripts share one notion of "the OSK we started".
+SQUEEKBOARD_PIDFILE="${XDG_RUNTIME_DIR:-/tmp}/evo-kiosk-squeekboard.pid"
+
+# Print the live squeekboard pid and succeed; fail when the
+# pidfile is absent, empty, or names a process that is gone.
+squeekboard_pid() {
+    [ -r "${SQUEEKBOARD_PIDFILE}" ] || return 1
+    _sq=$(head -1 "${SQUEEKBOARD_PIDFILE}" 2>/dev/null | tr -d '\r\n' || true)
+    [ -n "${_sq}" ] || return 1
+    kill -0 "${_sq}" 2>/dev/null || return 1
+    printf '%s' "${_sq}"
+    return 0
+}
+
+stop_osk() {
+    if _sq=$(squeekboard_pid); then
+        kill "${_sq}" 2>/dev/null || true
+    fi
+    rm -f "${SQUEEKBOARD_PIDFILE}"
+    # Belt-and-braces, mirroring evo-kiosk-osk-theme: reap any
+    # squeekboard the pidfile lost track of. `osk=none` has to
+    # leave no keyboard on the glass, including one spawned by a
+    # previous session whose pidfile did not survive.
+    if command -v pgrep >/dev/null 2>&1; then
+        for _pid in $(pgrep -u "$(id -u)" -x squeekboard 2>/dev/null || true); do
+            kill "${_pid}" 2>/dev/null || true
+        done
+    fi
+}
+
+apply_osk() {
+    want=$(read_overlay osk "squeekboard")
+    case "${want}" in
+        none)
+            stop_osk
+            log "osk=none -> OSK stopped"
+            ;;
+        *)
+            # An OSK already on screen is left exactly as it is.
+            # Re-running the helper here would kill and respawn a
+            # correctly themed keyboard for no reason, which the
+            # operator sees as a flicker mid-typing.
+            if _sq=$(squeekboard_pid); then
+                log "osk=${want} -> already running (pid=${_sq}); not cycling"
+                return 0
+            fi
+            if [ ! -x "${OSK_THEME_BIN}" ]; then
+                log "WARN: ${OSK_THEME_BIN} missing; cannot start OSK"
+                return 0
+            fi
+            "${OSK_THEME_BIN}" || log "WARN: OSK helper returned non-zero"
+            log "osk=${want} -> OSK started via ${OSK_THEME_BIN}"
+            ;;
+    esac
+}
+
 apply_all() {
     display_rot_raw=$(read_overlay display_rotation "$(read_overlay rotation 0)")
     apply_display_rotation "${display_rot_raw}"
     apply_sleep
+    apply_osk
 }
 
 # ---------------------------- lifecycle -------------------------------
 
+# Test seam: let a harness source this script for its apply
+# functions without arming the watch loop. Never set on a device;
+# the loop is the whole point of the daemon.
+if [ "${EVO_KIOSK_WATCH_LIB_ONLY:-0}" = "1" ]; then
+    # `return` succeeds when sourced (the harness case) and fails
+    # when executed, where the fallback exits instead. Shellcheck
+    # cannot see the sourced path, hence the disable.
+    # shellcheck disable=SC2317
+    return 0 2>/dev/null || exit 0
+fi
+
 # Kill the swayidle child when this watcher exits (session end).
-trap 'stop_swayidle' EXIT INT TERM
+# The signal traps must exit, not merely clean up.
+#
+# A handler bound to INT/TERM runs and then RESUMES the interrupted
+# loop. With one combined trap this watcher therefore absorbed
+# SIGTERM and carried on running. The session script kills the
+# previous watcher by signal before spawning a new one, so that
+# absorbed TERM is why live-apply daemons stacked across every
+# kiosk restart: the old one refused to die and the new one started
+# alongside it. Two watchers on the same overlays double every
+# apply — two swayidle children, two OSK decisions.
+#
+# EXIT does the cleanup; INT/TERM exit and let EXIT run once.
+trap 'stop_swayidle' EXIT
+trap 'exit 0' INT TERM
 
 # On first tick, apply whatever the overlays currently say. Ensures a
 # session started after an overlay edit picks up the new state even
@@ -250,7 +346,8 @@ run_poll_loop() {
     while true; do
         stamp=""
         for f in display_rotation touch_rotation touch_hflip touch_vflip rotation \
-                 sleep_timeout_seconds sleep_inhibit_while_playing sleep_inhibit_active; do
+                 sleep_timeout_seconds sleep_inhibit_while_playing \
+                 sleep_inhibit_active osk; do
             path="${SETTINGS_DIR}/${f}"
             if [ -r "${path}" ]; then
                 m=$(stat -c '%Y' "${path}" 2>/dev/null || echo 0)
@@ -296,6 +393,10 @@ run_inotify_loop() {
             sleep_timeout_seconds|sleep_inhibit_while_playing|sleep_inhibit_active)
                 sleep "0.$(printf '%03d' "${DEBOUNCE_MS}")"
                 apply_sleep
+                ;;
+            osk)
+                sleep "0.$(printf '%03d' "${DEBOUNCE_MS}")"
+                apply_osk
                 ;;
             osk_theme|ui-osk-theme|settings.json)
                 # settings.json is the authoritative Apply signal;

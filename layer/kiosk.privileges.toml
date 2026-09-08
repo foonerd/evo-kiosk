@@ -101,10 +101,6 @@ name = "wlr-randr"
 failure_mode = "scale + rotation overlays ignored at session start; kiosk falls back to compositor defaults"
 
 [[required_binaries]]
-name = "wtype"
-failure_mode = "HideCursor keybind (F24) not delivered; cursor stays visible when `cursor=hide` is set"
-
-[[required_binaries]]
 name = "gsettings"
 failure_mode = "OSK XKB layout apply skipped; falls back to compositor default layout"
 
@@ -202,7 +198,6 @@ required = [
   "xdg-dbus-proxy",
   "squeekboard",
   "wvkbd",
-  "wtype",
   "xkb-data",
   "fonts-dejavu-core",
   "libinput-tools",

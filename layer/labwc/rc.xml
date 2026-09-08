@@ -3,9 +3,15 @@
 <!--
   evo kiosk labwc config.
 
-  Minimal config: server-side decorations off, F24 bound to HideCursor.
-  The session script fires F24 via wtype when the operator sets
-  cursor=hide (overlay file).
+  Minimal config: server-side decorations off.
+
+  No cursor keybind. Pointer visibility is applied by evo-kiosk-launch,
+  which selects a transparent cursor theme before the compositor
+  starts. The former F24 binding invoked HideCursor, which labwc
+  restores on the next pointer action and which labwc 0.8.3 rejects
+  outright as an invalid action — the rejection was logged at config
+  parse, on every session, whether or not anything ever pressed the
+  key.
 
   IMPORTANT: no windowRule for fullscreen. The kiosk browser requests
   xdg_toplevel.set_maximized (see /usr/local/bin/evo-kiosk-browser).
@@ -38,13 +44,6 @@
   <keyboard>
     <!-- Keep the default labwc keybinds alongside ours. -->
     <default />
-
-    <!-- F24 is a high function key not present on any real keyboard.
-         Safe to use as an IPC signal from the session script via wtype
-         without colliding with user input or application shortcuts. -->
-    <keybind key="F24">
-      <action name="HideCursor" />
-    </keybind>
   </keyboard>
 
   <!-- Touch device mapping. Empty deviceName matches every touchscreen,

@@ -49,6 +49,22 @@ use thiserror::Error;
 /// changing it requires updating every consumer together.
 pub const OVERLAY_DIR: &str = "/var/lib/evo/settings/kiosk";
 
+/// The overlay directory this process actually reads and writes.
+///
+/// Honours `KIOSK_SETTINGS_DIR` — the same environment variable
+/// `evo-kiosk-launch` and `evo-kiosk-watch-settings` already
+/// consult — and falls back to [`OVERLAY_DIR`]. On a device
+/// nothing sets it, so every consumer converges on the
+/// distribution-conventional path; a harness can point the whole
+/// read/write surface at a scratch directory without the shipped
+/// default ever moving.
+fn overlay_dir() -> PathBuf {
+    match std::env::var("KIOSK_SETTINGS_DIR") {
+        Ok(v) if !v.trim().is_empty() => PathBuf::from(v),
+        _ => PathBuf::from(OVERLAY_DIR),
+    }
+}
+
 // ------------------------------ defaults ------------------------------
 //
 // One authoritative default per operator setting. Reader helpers and
@@ -96,6 +112,66 @@ pub const DEFAULT_SLEEP_INHIBIT_ACTIVE: bool = false;
 /// takes effect).
 pub const DEFAULT_KIOSK_ENABLED: bool = true;
 
+/// Default OSK engine. Matches `evo-kiosk-launch`
+/// (`resolve osk osk squeekboard`); `evo-kiosk-session` starts
+/// squeekboard for any value it does not recognise, so this is
+/// also the effective default for a malformed overlay.
+pub const DEFAULT_OSK: &str = "squeekboard";
+
+/// Default operator-visible OSK toggle. [`DEFAULT_OSK`] names an
+/// engine, so the keyboard is on when no overlay is present.
+pub const DEFAULT_OSK_ENABLED: bool = true;
+
+/// Default cursor policy. Matches `evo-kiosk-launch`
+/// (`resolve cursor cursor auto`).
+pub const DEFAULT_CURSOR: &str = "auto";
+
+/// Default operator-visible pointer toggle. `evo-kiosk-session`
+/// fires HideCursor only when the policy is exactly `hide`, so
+/// `auto` — and anything unrecognised — leaves the pointer
+/// visible.
+pub const DEFAULT_CURSOR_VISIBLE: bool = true;
+
+/// Canonicalise an `osk` overlay value. `squeekboard` is the
+/// engine this distribution ships; `wvkbd` is recognised because
+/// `evo-kiosk-session` still honours an overlay that names it,
+/// and refusing to *read* it would make an existing device
+/// unreportable. `none` means no keyboard. Any other value
+/// returns `None` so a caller can refuse rather than guess.
+pub fn normalise_osk(raw: &str) -> Option<&'static str> {
+    match raw.trim() {
+        "squeekboard" => Some("squeekboard"),
+        "wvkbd" => Some("wvkbd"),
+        "none" => Some("none"),
+        _ => None,
+    }
+}
+
+/// Canonicalise a `cursor` overlay value. `auto` is the launch
+/// default and leaves the pointer visible; `show` and `hide` are
+/// the operator's explicit choices. Any other value returns
+/// `None`.
+pub fn normalise_cursor(raw: &str) -> Option<&'static str> {
+    match raw.trim() {
+        "auto" => Some("auto"),
+        "show" => Some("show"),
+        "hide" => Some("hide"),
+        _ => None,
+    }
+}
+
+/// Project a canonical `osk` value onto the operator-facing
+/// bool. Any named engine is "keyboard on".
+fn osk_value_enabled(value: &str) -> Option<bool> {
+    normalise_osk(value).map(|v| v != "none")
+}
+
+/// Project a canonical `cursor` value onto the operator-facing
+/// bool. Only `hide` hides the pointer.
+fn cursor_value_visible(value: &str) -> Option<bool> {
+    normalise_cursor(value).map(|v| v != "hide")
+}
+
 /// Normalise the operator-facing rotation string to one of the
 /// four canonical values `"0"`, `"90"`, `"180"`, `"270"`.
 /// Accepts `"normal"` as an alias for `"0"` (mirrors what the
@@ -127,6 +203,18 @@ pub enum KioskConfigError {
     /// should never send these; a bounds check surfaces UI bugs.
     #[error("sample coord {0} outside [0, 1]")]
     SampleOutOfRange(f64),
+    /// The `osk` overlay already on disk holds a value this crate
+    /// does not recognise. Refused rather than overwritten: the
+    /// value was put there by something, and silently replacing
+    /// it with a default would destroy a configuration we simply
+    /// failed to parse.
+    #[error("unrecognised osk overlay '{0}'; expected squeekboard | wvkbd | none")]
+    InvalidOsk(String),
+    /// The `cursor` overlay already on disk holds a value this
+    /// crate does not recognise. Refused for the same reason as
+    /// [`Self::InvalidOsk`].
+    #[error("unrecognised cursor overlay '{0}'; expected auto | show | hide")]
+    InvalidCursor(String),
 }
 
 /// Atomic write of a small text overlay: write to `<path>.tmp`,
@@ -159,7 +247,7 @@ fn write_overlay_atomic(path: &Path, contents: &str) -> Result<(), KioskConfigEr
 pub fn set_display_rotation(rotation: &str) -> Result<&'static str, KioskConfigError> {
     let normalised = normalise_rotation(rotation)
         .ok_or_else(|| KioskConfigError::InvalidRotation(rotation.to_string()))?;
-    let path = Path::new(OVERLAY_DIR).join("display_rotation");
+    let path = overlay_dir().join("display_rotation");
     write_overlay_atomic(&path, normalised)?;
     Ok(normalised)
 }
@@ -174,7 +262,7 @@ pub fn set_brightness(percent: u8) -> Result<u8, KioskConfigError> {
             "brightness percent {percent} out of 0..=100"
         )));
     }
-    let path = Path::new(OVERLAY_DIR).join("brightness");
+    let path = overlay_dir().join("brightness");
     write_overlay_atomic(&path, &percent.to_string())?;
     Ok(percent)
 }
@@ -189,7 +277,7 @@ pub fn set_sleep_timeout(seconds: u32) -> Result<u32, KioskConfigError> {
             "sleep_timeout_seconds {seconds}: minimum non-zero value is 5"
         )));
     }
-    let path = Path::new(OVERLAY_DIR).join("sleep_timeout_seconds");
+    let path = overlay_dir().join("sleep_timeout_seconds");
     write_overlay_atomic(&path, &seconds.to_string())?;
     Ok(seconds)
 }
@@ -200,7 +288,7 @@ pub fn set_sleep_timeout(seconds: u32) -> Result<u32, KioskConfigError> {
 /// override the base timeout while audio is playing. Returns
 /// the persisted flag.
 pub fn set_sleep_inhibit_while_playing(enabled: bool) -> Result<bool, KioskConfigError> {
-    let path = Path::new(OVERLAY_DIR).join("sleep_inhibit_while_playing");
+    let path = overlay_dir().join("sleep_inhibit_while_playing");
     write_overlay_atomic(&path, if enabled { "true" } else { "false" })?;
     Ok(enabled)
 }
@@ -214,7 +302,7 @@ pub fn set_sleep_inhibit_while_playing(enabled: bool) -> Result<bool, KioskConfi
 /// preference persists across playback transitions without
 /// stomping.
 pub fn set_sleep_inhibit_active(active: bool) -> Result<bool, KioskConfigError> {
-    let path = Path::new(OVERLAY_DIR).join("sleep_inhibit_active");
+    let path = overlay_dir().join("sleep_inhibit_active");
     write_overlay_atomic(&path, if active { "true" } else { "false" })?;
     Ok(active)
 }
@@ -226,9 +314,56 @@ pub fn set_sleep_inhibit_active(active: bool) -> Result<bool, KioskConfigError> 
 /// the UI's current-state display so it does not have to poll
 /// systemd on every settings-page render.
 pub fn set_kiosk_enabled(enabled: bool) -> Result<bool, KioskConfigError> {
-    let path = Path::new(OVERLAY_DIR).join("kiosk_enabled");
+    let path = overlay_dir().join("kiosk_enabled");
     write_overlay_atomic(&path, if enabled { "true" } else { "false" })?;
     Ok(enabled)
+}
+
+/// Persist the `osk` overlay from an operator bool. `true`
+/// writes [`DEFAULT_OSK`] — squeekboard is the engine this
+/// distribution ships and the only one the live-apply path
+/// starts — and `false` writes `none`.
+///
+/// The wire carries a bool, not an engine name: "on-screen
+/// keyboard, yes or no" is the operator's question, and keeping
+/// the engine out of the verb means a future engine swap is not
+/// an API break.
+///
+/// A value already on disk that this crate does not recognise is
+/// refused rather than overwritten. Turning the keyboard on must
+/// not be the act that destroys a configuration we merely failed
+/// to parse. An overlay naming a recognised engine is replaced
+/// normally — including `wvkbd`, which normalises to the shipped
+/// engine on the next write.
+pub fn set_osk(enabled: bool) -> Result<bool, KioskConfigError> {
+    if let Some(existing) = read_overlay("osk") {
+        if normalise_osk(&existing).is_none() {
+            return Err(KioskConfigError::InvalidOsk(existing));
+        }
+    }
+    let value = if enabled { DEFAULT_OSK } else { "none" };
+    write_overlay_atomic(&overlay_dir().join("osk"), value)?;
+    Ok(enabled)
+}
+
+/// Persist the `cursor` overlay from an operator bool. `true`
+/// writes `show`, `false` writes `hide`.
+///
+/// `show` is written rather than `auto` because the operator has
+/// now made the choice explicitly; `auto` remains the meaning of
+/// "no overlay yet" and still reads back as visible.
+///
+/// An unrecognised value already on disk is refused, for the same
+/// reason as [`set_osk`].
+pub fn set_cursor(visible: bool) -> Result<bool, KioskConfigError> {
+    if let Some(existing) = read_overlay("cursor") {
+        if normalise_cursor(&existing).is_none() {
+            return Err(KioskConfigError::InvalidCursor(existing));
+        }
+    }
+    let value = if visible { "show" } else { "hide" };
+    write_overlay_atomic(&overlay_dir().join("cursor"), value)?;
+    Ok(visible)
 }
 
 /// Persist the touch calibration triple. Writes proceed in
@@ -245,7 +380,7 @@ pub fn set_touch_calibration(
 ) -> Result<(&'static str, bool, bool), KioskConfigError> {
     let normalised = normalise_rotation(rotation)
         .ok_or_else(|| KioskConfigError::InvalidRotation(rotation.to_string()))?;
-    let dir = Path::new(OVERLAY_DIR);
+    let dir = overlay_dir();
     write_overlay_atomic(&dir.join("touch_rotation"), normalised)?;
     write_overlay_atomic(
         &dir.join("touch_hflip"),
@@ -467,12 +602,20 @@ pub struct DisplayState {
     /// the UI so it does not have to poll systemd on every
     /// settings-page render.
     pub enabled: bool,
+    /// Operator toggle for the on-screen keyboard. Projected from
+    /// the `osk` overlay: any named engine is `true`, `none` is
+    /// `false`.
+    pub osk_enabled: bool,
+    /// Operator toggle for the mouse pointer. Projected from the
+    /// `cursor` overlay: `hide` is `false`, `auto` and `show` are
+    /// `true`.
+    pub cursor_visible: bool,
 }
 
 /// Read a single-line overlay file. Returns `Some(trimmed_string)`
 /// when the file is present and non-empty, `None` otherwise.
 fn read_overlay(name: &str) -> Option<String> {
-    let path = Path::new(OVERLAY_DIR).join(name);
+    let path = overlay_dir().join(name);
     match std::fs::read_to_string(&path) {
         Ok(s) => {
             let trimmed = s.trim().to_string();
@@ -580,6 +723,29 @@ pub fn read_kiosk_enabled() -> bool {
         .unwrap_or(DEFAULT_KIOSK_ENABLED)
 }
 
+/// Read the persisted OSK toggle. Falls back to
+/// [`DEFAULT_OSK_ENABLED`] when the overlay is absent, empty, or
+/// names an engine this crate does not recognise — matching
+/// `evo-kiosk-session`, which starts squeekboard for any value it
+/// does not recognise. The refusing path is the write side
+/// ([`set_osk`]); a read never fails, so the settings panel can
+/// always render.
+pub fn read_osk_enabled() -> bool {
+    read_overlay("osk")
+        .and_then(|s| osk_value_enabled(&s))
+        .unwrap_or(DEFAULT_OSK_ENABLED)
+}
+
+/// Read the persisted pointer toggle. Falls back to
+/// [`DEFAULT_CURSOR_VISIBLE`] when the overlay is absent, empty,
+/// or unrecognised — matching `evo-kiosk-session`, which hides the
+/// pointer only on an exact `hide`.
+pub fn read_cursor_visible() -> bool {
+    read_overlay("cursor")
+        .and_then(|s| cursor_value_visible(&s))
+        .unwrap_or(DEFAULT_CURSOR_VISIBLE)
+}
+
 /// Read the complete operator-visible state. Composes every
 /// individual reader above into a single [`DisplayState`] the
 /// plugin's `get_display_state` verb returns. Never fails — a
@@ -599,6 +765,8 @@ pub fn read_display_state() -> DisplayState {
         sleep_timeout_seconds: read_sleep_timeout_seconds(),
         sleep_inhibit_while_playing: read_sleep_inhibit_while_playing(),
         enabled: read_kiosk_enabled(),
+        osk_enabled: read_osk_enabled(),
+        cursor_visible: read_cursor_visible(),
     }
 }
 
@@ -780,6 +948,179 @@ mod tests {
         assert_eq!(parse_bool(""), None);
     }
 
+    // ---------------------- overlay round-trip harness ----------------
+    //
+    // These fixtures exercise the real read/write path against a
+    // scratch directory via `KIOSK_SETTINGS_DIR`. The env var is
+    // process-global, so they serialise on one lock; the guard
+    // restores the previous value (and removes the scratch tree)
+    // on drop so a panicking assertion cannot leak state into the
+    // next test.
+
+    static OVERLAY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static SCRATCH_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    struct ScratchOverlays {
+        dir: PathBuf,
+        previous: Option<String>,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ScratchOverlays {
+        fn new() -> Self {
+            let guard = OVERLAY_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let n = SCRATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir =
+                std::env::temp_dir().join(format!("evo-kiosk-cfg-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+            let previous = std::env::var("KIOSK_SETTINGS_DIR").ok();
+            std::env::set_var("KIOSK_SETTINGS_DIR", &dir);
+            Self {
+                dir,
+                previous,
+                _guard: guard,
+            }
+        }
+
+        fn write(&self, name: &str, contents: &str) {
+            std::fs::write(self.dir.join(name), contents).expect("seed overlay");
+        }
+
+        /// The exact bytes on disk, so a fixture asserts what the
+        /// applier will read rather than what the setter returned.
+        fn bytes(&self, name: &str) -> Option<String> {
+            std::fs::read_to_string(self.dir.join(name)).ok()
+        }
+    }
+
+    impl Drop for ScratchOverlays {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(v) => std::env::set_var("KIOSK_SETTINGS_DIR", v),
+                None => std::env::remove_var("KIOSK_SETTINGS_DIR"),
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn set_osk_writes_the_engine_name_the_session_reads() {
+        // The session script matches on the literal engine name,
+        // so the bool has to land as bytes it recognises.
+        let s = ScratchOverlays::new();
+        assert!(set_osk(true).unwrap());
+        assert_eq!(s.bytes("osk").as_deref(), Some("squeekboard"));
+        assert!(!set_osk(false).unwrap());
+        assert_eq!(s.bytes("osk").as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn set_cursor_writes_show_and_hide() {
+        let s = ScratchOverlays::new();
+        assert!(!set_cursor(false).unwrap());
+        assert_eq!(s.bytes("cursor").as_deref(), Some("hide"));
+        assert!(set_cursor(true).unwrap());
+        assert_eq!(s.bytes("cursor").as_deref(), Some("show"));
+    }
+
+    #[test]
+    fn an_unrecognised_osk_overlay_is_refused_not_clobbered() {
+        // Something put that value there. Turning the keyboard on
+        // must not be the act that destroys it.
+        let s = ScratchOverlays::new();
+        s.write("osk", "some-future-engine");
+        let err = set_osk(true).expect_err("must refuse");
+        assert!(
+            matches!(err, KioskConfigError::InvalidOsk(ref v)
+                     if v == "some-future-engine"),
+            "got {err:?}"
+        );
+        assert_eq!(
+            s.bytes("osk").as_deref(),
+            Some("some-future-engine"),
+            "the refused write must leave the overlay untouched"
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_cursor_overlay_is_refused_not_clobbered() {
+        let s = ScratchOverlays::new();
+        s.write("cursor", "dim");
+        let err = set_cursor(true).expect_err("must refuse");
+        assert!(
+            matches!(err, KioskConfigError::InvalidCursor(ref v) if v == "dim"),
+            "got {err:?}"
+        );
+        assert_eq!(s.bytes("cursor").as_deref(), Some("dim"));
+    }
+
+    #[test]
+    fn a_recognised_overlay_is_replaced_normally() {
+        // `wvkbd` is readable legacy, so writing over it is not a
+        // clobber — it normalises to the shipped engine.
+        let s = ScratchOverlays::new();
+        s.write("osk", "wvkbd");
+        assert!(read_osk_enabled(), "a named engine reads as on");
+        assert!(set_osk(true).unwrap());
+        assert_eq!(s.bytes("osk").as_deref(), Some("squeekboard"));
+    }
+
+    #[test]
+    fn a_missing_overlay_reads_the_documented_default() {
+        let s = ScratchOverlays::new();
+        assert_eq!(s.bytes("osk"), None);
+        assert_eq!(s.bytes("cursor"), None);
+        assert_eq!(read_osk_enabled(), DEFAULT_OSK_ENABLED);
+        assert_eq!(read_cursor_visible(), DEFAULT_CURSOR_VISIBLE);
+    }
+
+    #[test]
+    fn an_unreadable_overlay_still_reads_the_documented_default() {
+        // The read side never fails — the settings panel has to
+        // render even when the overlay is nonsense. Refusing is
+        // the write side's job.
+        let s = ScratchOverlays::new();
+        s.write("osk", "some-future-engine");
+        s.write("cursor", "dim");
+        assert_eq!(read_osk_enabled(), DEFAULT_OSK_ENABLED);
+        assert_eq!(read_cursor_visible(), DEFAULT_CURSOR_VISIBLE);
+    }
+
+    #[test]
+    fn read_display_state_reports_both_new_axes() {
+        // Named binding, not `_`: the guard has to live to the end
+        // of the test, and a bare `_` would drop it immediately —
+        // restoring the env var mid-test.
+        let _scratch = ScratchOverlays::new();
+        set_osk(false).unwrap();
+        set_cursor(false).unwrap();
+        let state = read_display_state();
+        assert!(!state.osk_enabled);
+        assert!(!state.cursor_visible);
+
+        set_osk(true).unwrap();
+        set_cursor(true).unwrap();
+        let state = read_display_state();
+        assert!(state.osk_enabled);
+        assert!(state.cursor_visible);
+    }
+
+    #[test]
+    fn normalises_osk_and_cursor_values() {
+        assert_eq!(normalise_osk(" squeekboard "), Some("squeekboard"));
+        assert_eq!(normalise_osk("wvkbd"), Some("wvkbd"));
+        assert_eq!(normalise_osk("none"), Some("none"));
+        assert_eq!(normalise_osk("onboard"), None);
+        assert_eq!(normalise_osk(""), None);
+        assert_eq!(normalise_cursor("auto"), Some("auto"));
+        assert_eq!(normalise_cursor(" show "), Some("show"));
+        assert_eq!(normalise_cursor("hide"), Some("hide"));
+        assert_eq!(normalise_cursor("dim"), None);
+    }
+
     #[test]
     fn display_state_wire_shape_matches_ui_spec() {
         // Locks the JSON shape to the UI contract.
@@ -796,6 +1137,8 @@ mod tests {
             sleep_timeout_seconds: 120,
             sleep_inhibit_while_playing: true,
             enabled: true,
+            osk_enabled: true,
+            cursor_visible: false,
         };
         let json = serde_json::to_value(&s).unwrap();
         assert_eq!(json["display_rotation"], "270");
@@ -806,18 +1149,32 @@ mod tests {
         assert_eq!(json["sleep_timeout_seconds"], 120);
         assert_eq!(json["sleep_inhibit_while_playing"], true);
         assert_eq!(json["enabled"], true);
+        assert_eq!(json["osk_enabled"], true);
+        assert_eq!(json["cursor_visible"], false);
     }
 
     #[test]
     fn defaults_are_the_operator_visible_expected_values() {
         // If any of these change, the UI's fresh-boot render
         // changes with them — flag it as a coordinated change.
-        assert_eq!(DEFAULT_ROTATION, "0");
-        assert!(!DEFAULT_TOUCH_FLIP);
-        assert_eq!(DEFAULT_BRIGHTNESS_PERCENT, 80);
-        assert_eq!(DEFAULT_SLEEP_TIMEOUT_SECONDS, 120);
-        assert!(DEFAULT_SLEEP_INHIBIT_WHILE_PLAYING);
-        assert!(!DEFAULT_SLEEP_INHIBIT_ACTIVE);
-        assert!(DEFAULT_KIOSK_ENABLED);
+        //
+        // Asserted in `const` blocks so a drifted default is a
+        // compile error rather than a test failure: these are the
+        // values other components are written against, and the
+        // build should stop before anything links against a new
+        // one.
+        const {
+            assert!(matches!(DEFAULT_ROTATION.as_bytes(), b"0"));
+            assert!(!DEFAULT_TOUCH_FLIP);
+            assert!(DEFAULT_BRIGHTNESS_PERCENT == 80);
+            assert!(DEFAULT_SLEEP_TIMEOUT_SECONDS == 120);
+            assert!(DEFAULT_SLEEP_INHIBIT_WHILE_PLAYING);
+            assert!(!DEFAULT_SLEEP_INHIBIT_ACTIVE);
+            assert!(DEFAULT_KIOSK_ENABLED);
+            assert!(matches!(DEFAULT_OSK.as_bytes(), b"squeekboard"));
+            assert!(DEFAULT_OSK_ENABLED);
+            assert!(matches!(DEFAULT_CURSOR.as_bytes(), b"auto"));
+            assert!(DEFAULT_CURSOR_VISIBLE);
+        }
     }
 }
