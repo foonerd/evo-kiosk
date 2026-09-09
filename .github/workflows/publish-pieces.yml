@@ -30,6 +30,10 @@ jobs:
           PLUGIN_SIGNING_KEY_PEM: ${{ secrets.PLUGIN_SIGNING_KEY_PEM }}
         run: |
           set -euo pipefail
+          if [ -z "${PLUGIN_SIGNING_KEY_PEM:-}" ]; then
+            echo "::error::PLUGIN_SIGNING_KEY_PEM is empty — set the audio commons key on this repo (same secret as foonerd/evo-device-audio)"
+            exit 1
+          fi
           VERSION=$(tr -d '[:space:]' < VERSION)
           SRC=/tmp/kiosk-src
           mkdir -p "$SRC"
