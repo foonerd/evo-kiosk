@@ -21,9 +21,8 @@ use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use evo_kiosk_browser::{
-    derive_and_apply_touch_calibration, kiosk_sock_path, local_storage_inject_script,
-    mint_with_retry, navigation_allowed, parse_allowed_origin, renew_at_ms, set_display_rotation,
-    set_touch_calibration, MintedSession, TouchSample,
+    kiosk_sock_path, local_storage_inject_script, mint_with_retry, navigation_allowed,
+    parse_allowed_origin, renew_at_ms, MintedSession,
 };
 use gio::prelude::*;
 use gio::ApplicationFlags;
@@ -119,141 +118,21 @@ fn mint_session(reason: &str) -> Result<MintedSession, String> {
     })
 }
 
-/// Register the three kiosk-settings script-message handlers on
-/// the given UCM. JS calls one of these via
-/// `window.webkit.messageHandlers.<name>.postMessage(<json>)` and
-/// the handler writes the overlay files kiosk-side machinery
-/// observes.
-///
-/// Wire contract (all payloads are JSON strings; the UI does
-/// `JSON.stringify(payload)` before postMessage):
-///
-///   evo_set_display_rotation:
-///     payload = "0" | "90" | "180" | "270"
-///     (bare string, no wrapping JSON — one axis one value)
-///
-///   evo_set_touch_calibration:
-///     payload = {"rotation":"0"|"90"|"180"|"270", "hflip":bool, "vflip":bool}
-///
-///   evo_sample_touch_calibration_from_corners:
-///     payload = {"samples":[{"target_x":n,"target_y":n,"actual_x":n,"actual_y":n}, ...4 samples]}
-///     Result — derived rotation/hflip/vflip + mean_error — is
-///     published to `window.evoTouchCalibrationDerived` and a
-///     `CustomEvent('evo:touch-calibration-derived')` is dispatched
-///     on `window` so the wizard UI can react.
-///
-/// One-way postMessage semantics keep the handler side simple;
-/// the wizard result comes back via evaluate_javascript-driven
-/// DOM notification rather than a promise return (webkit6's
-/// with-reply variant would nest closure lifetimes; the DOM
-/// event approach is friendlier to a UI already event-driven).
-fn install_kiosk_settings_handlers(ucm: &UserContentManager, webview: &WebView) {
-    // Register handler slots. Passing `None` for the world scopes
-    // to the main world (the one the UI's own scripts run in),
-    // which is what we want — the UI is a trusted local first-
-    // party page and needs to invoke these.
+/// Glass presence probe. The UI's `kioskMode()` treats
+/// `window.webkit.messageHandlers.evo_set_display_rotation` as
+/// "this is the on-device browser". Display and touch writes now
+/// go through `system.kiosk` verbs, so this slot must stay
+/// registered and must not write overlays. The two touch writer
+/// names are not registered: a script that still posts them
+/// fails closed instead of skipping the household gate.
+fn install_kiosk_glass_probe(ucm: &UserContentManager) {
     ucm.register_script_message_handler("evo_set_display_rotation", None);
-    ucm.register_script_message_handler("evo_set_touch_calibration", None);
-    ucm.register_script_message_handler("evo_sample_touch_calibration_from_corners", None);
-
-    ucm.connect_script_message_received(Some("evo_set_display_rotation"), |_ucm, value| {
-        let rotation = value.to_str();
-        match set_display_rotation(&rotation) {
-            Ok(applied) => log_line(&format!(
-                "settings: display_rotation → {applied} (from JS handler)"
-            )),
-            Err(e) => log_line(&format!(
-                "settings: display_rotation JS handler refused: {e}"
-            )),
-        }
+    ucm.connect_script_message_received(Some("evo_set_display_rotation"), |_ucm, _value| {
+        log_line(
+            "settings: evo_set_display_rotation is a presence probe; \
+             display writes go through system.kiosk",
+        );
     });
-
-    ucm.connect_script_message_received(Some("evo_set_touch_calibration"), |_ucm, value| {
-        let payload = value.to_str();
-        #[derive(serde::Deserialize)]
-        struct Req {
-            rotation: String,
-            #[serde(default)]
-            hflip: bool,
-            #[serde(default)]
-            vflip: bool,
-        }
-        let req: Req = match serde_json::from_str(&payload) {
-            Ok(r) => r,
-            Err(e) => {
-                log_line(&format!(
-                    "settings: touch_calibration JS payload invalid JSON: {e}"
-                ));
-                return;
-            }
-        };
-        match set_touch_calibration(&req.rotation, req.hflip, req.vflip) {
-            Ok((r, h, v)) => log_line(&format!(
-                "settings: touch_calibration → rotation={r} hflip={h} vflip={v} (from JS handler)"
-            )),
-            Err(e) => log_line(&format!(
-                "settings: touch_calibration JS handler refused: {e}"
-            )),
-        }
-    });
-
-    let webview_for_wizard = webview.clone();
-    ucm.connect_script_message_received(
-        Some("evo_sample_touch_calibration_from_corners"),
-        move |_ucm, value| {
-            let payload = value.to_str();
-            #[derive(serde::Deserialize)]
-            struct SampleWire {
-                target_x: f64,
-                target_y: f64,
-                actual_x: f64,
-                actual_y: f64,
-            }
-            #[derive(serde::Deserialize)]
-            struct Req {
-                samples: Vec<SampleWire>,
-            }
-            let req: Req = match serde_json::from_str(&payload) {
-                Ok(r) => r,
-                Err(e) => {
-                    log_line(&format!("settings: wizard JS payload invalid JSON: {e}"));
-                    publish_wizard_result_via_dom_event(&webview_for_wizard, None);
-                    return;
-                }
-            };
-            let internal: Vec<TouchSample> = req
-                .samples
-                .into_iter()
-                .map(|s| TouchSample {
-                    target_x: s.target_x,
-                    target_y: s.target_y,
-                    actual_x: s.actual_x,
-                    actual_y: s.actual_y,
-                })
-                .collect();
-            match derive_and_apply_touch_calibration(&internal) {
-                Ok(d) => {
-                    log_line(&format!(
-                        "settings: wizard derived rotation={} hflip={} vflip={} mean_error={:.6}",
-                        d.rotation, d.hflip, d.vflip, d.mean_error
-                    ));
-                    publish_wizard_result_via_dom_event(
-                        &webview_for_wizard,
-                        Some(WizardResult {
-                            rotation: d.rotation,
-                            hflip: d.hflip,
-                            vflip: d.vflip,
-                            mean_error: d.mean_error,
-                        }),
-                    );
-                }
-                Err(e) => {
-                    log_line(&format!("settings: wizard refused: {e}"));
-                    publish_wizard_result_via_dom_event(&webview_for_wizard, None);
-                }
-            }
-        },
-    );
 }
 
 /// Polling window for the `calibrate_trigger` overlay file. 500 ms
@@ -338,39 +217,6 @@ fn current_trigger_mtime() -> Option<SystemTime> {
     std::fs::metadata(CALIBRATE_TRIGGER_PATH)
         .and_then(|m| m.modified())
         .ok()
-}
-
-/// Result the wizard hands back to the UI. Only used to publish
-/// via a DOM event; the UI reflects the applied values from its
-/// own state after receiving the event.
-struct WizardResult {
-    rotation: &'static str,
-    hflip: bool,
-    vflip: bool,
-    mean_error: f64,
-}
-
-/// Evaluate a small JS snippet in the live page context that
-/// publishes the wizard result to `window.evoTouchCalibrationDerived`
-/// and fires a `CustomEvent('evo:touch-calibration-derived')` on
-/// window. The UI wizard listens for this event. Silent on
-/// failure — the UI already has a timeout on the wizard call.
-fn publish_wizard_result_via_dom_event(webview: &WebView, result: Option<WizardResult>) {
-    let detail_json = match result {
-        Some(r) => format!(
-            "{{\"ok\":true,\"rotation\":\"{}\",\"hflip\":{},\"vflip\":{},\"mean_error\":{:.6}}}",
-            r.rotation, r.hflip, r.vflip, r.mean_error
-        ),
-        None => "{\"ok\":false}".to_string(),
-    };
-    let script = format!(
-        "(() => {{ \
-             const detail = {detail_json}; \
-             window.evoTouchCalibrationDerived = detail; \
-             window.dispatchEvent(new CustomEvent('evo:touch-calibration-derived', {{detail}})); \
-         }})();"
-    );
-    webview.evaluate_javascript(&script, None, None, None::<&gio::Cancellable>, |_| {});
 }
 
 fn install_bearer_script(ucm: &UserContentManager, token: &str) {
@@ -482,18 +328,10 @@ fn build_ui(app: &Application, url: &str, zoom: f64, reason: &str) {
         .focusable(true)
         .build();
 
-    // Kiosk settings handlers. Registered on the UCM so they are
-    // reachable only from within the kiosk browser process — a
-    // paired laptop or phone browser loading the same URL cannot
-    // reach these handlers because `window.webkit.messageHandlers`
-    // is a per-instance webkit surface. This matches the physical
-    // reality that display + touch rotation are per-device
-    // physical settings; a remote client rotating a screen it
-    // cannot see is not a useful capability. Handlers write the
-    // overlay files under `/var/lib/evo/settings/kiosk/`; the
-    // systemd path unit + in-session watcher pick up the writes
-    // and apply. Whole flow is local by construction.
-    install_kiosk_settings_handlers(&ucm, &webview);
+    // Presence probe only. Overlay writes go through system.kiosk.
+    // Remote launch of the on-glass wizard is the trigger-file
+    // watcher below, not a WebKit write handler.
+    install_kiosk_glass_probe(&ucm);
     install_calibrate_trigger_watcher(&webview);
 
     if (zoom - 1.0).abs() > f64::EPSILON {

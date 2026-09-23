@@ -84,7 +84,6 @@ dependencies = [
 name = "evo-kiosk-browser"
 version = "0.1.13"
 dependencies = [
- "evo-kiosk-config",
  "gio",
  "glib",
  "gtk4",
