@@ -37,7 +37,7 @@ non-headless boot
 
 ## Mint ownership
 
-The **browser binary** owns `mint_local_kiosk_session` and bearer inject against `/run/evo/kiosk.sock` only (never `/run/evo/evo.sock`). Inject path is `localStorage.evoBearer` (matches evo-ui `storedBearer`); the bearer never appears in systemd `Environment=` or world-readable files. Session/launch scripts may wait for socket readiness; they must not mint, carry, or log the bearer. Silent renewal and WebProcess-crash remint stay in the browser process.
+The **browser binary** owns `mint_local_kiosk_session` and bearer inject against `/run/evo/kiosk.sock` only (never `/run/evo/evo.sock`). Inject path is `localStorage.evoBearer` (matches evo-ui `storedBearer`); the bearer never appears in systemd `Environment=` or world-readable files. Session/launch scripts may wait for socket readiness; they must not mint, carry, or log the bearer. Silent renewal and WebProcess-crash remint stay in the browser process. The browser also probes the steward about every 15 seconds with the bearer it holds; if the steward refuses it (revoked, reset, key rotated), the browser drops it, mints a new one on the local socket and reloads the page, with no unit restart. This watch runs only when `KIOSK_URL` is plain `http`.
 
 ## Environment variables
 

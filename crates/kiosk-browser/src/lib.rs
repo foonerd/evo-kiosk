@@ -8,6 +8,7 @@
 //! them without GTK/WebKit headers. The binary shell links GTK4 and
 //! webkit2gtk.
 
+pub mod bearer_watch;
 pub mod mint;
 pub mod nav_policy;
 
@@ -19,6 +20,9 @@ pub mod nav_policy;
 // — and nothing in this tree imported the re-exports afterwards.
 // The plugin depends on `evo-kiosk-config` directly. A consumer
 // that needs the write path takes that crate, not this one.
+pub use bearer_watch::{
+    classify_status_line, probe_bearer, BearerState, KioskBearer, WatchAction, BEARER,
+};
 pub use mint::{
     js_string_literal, kiosk_sock_path, local_storage_inject_script, mint_once, mint_with_retry,
     renew_at_ms, MintError, MintedSession, BEARER_STORAGE_KEY, DEFAULT_KIOSK_SOCK,
@@ -39,6 +43,29 @@ mod glass_probe {
             !MAIN.contains("evo_sample_touch_calibration_from_corners"),
             "derive writer slot must not be registered"
         );
+    }
+
+    #[test]
+    fn the_page_is_only_ever_handed_the_held_bearer() {
+        // A dead bearer must not be written again. Every page script
+        // comes from the held bearer, which drops a refused one first.
+        assert!(
+            !MAIN.contains("UserScript::new(\n        &local_storage_inject_script"),
+            "a page script built straight from a token bypasses the held bearer"
+        );
+        assert!(
+            MAIN.contains("held.script()"),
+            "the script comes from the held bearer"
+        );
+        assert!(
+            MAIN.contains("held.on_probe(state)"),
+            "the steward's answer decides"
+        );
+        assert!(
+            MAIN.contains("drop_bearer_script(&ucm);\n                match mint_session"),
+            "a refused bearer is dropped before a replacement is minted"
+        );
+        assert!(MAIN.contains("start_bearer_watch(&webview, &ucm, url, reason)"));
     }
 
     #[test]

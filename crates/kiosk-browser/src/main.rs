@@ -18,11 +18,13 @@
 use std::cell::RefCell;
 use std::env;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use evo_kiosk_browser::{
     kiosk_sock_path, local_storage_inject_script, mint_with_retry, navigation_allowed,
-    parse_allowed_origin, renew_at_ms, MintedSession,
+    parse_allowed_origin, probe_bearer, renew_at_ms, BearerState, MintedSession, WatchAction,
+    BEARER,
 };
 use gio::prelude::*;
 use gio::ApplicationFlags;
@@ -43,6 +45,13 @@ const RELOAD_DELAY_MS: u64 = 1000;
 const MAXIMIZE_RETRY_MS: u64 = 200;
 const MINT_ATTEMPTS: u32 = 8;
 const MINT_INITIAL_BACKOFF_MS: u64 = 250;
+/// How often the panel asks the steward whether it still honours the
+/// bearer it presents. Loopback and one short-lived request, so a
+/// refused bearer is noticed in seconds, not at the daily renewal.
+const BEARER_WATCH_SECS: u32 = 15;
+
+/// Generation of the renewal timer; see `schedule_renew`.
+static RENEW_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 fn log_line(msg: &str) {
     // Never include the bearer. systemd journal greps align with
@@ -219,16 +228,115 @@ fn current_trigger_mtime() -> Option<SystemTime> {
         .ok()
 }
 
-fn install_bearer_script(ucm: &UserContentManager, token: &str) {
+/// Hold `session` as the bearer this panel presents and write it into
+/// every page load from here on. The page script is built from the held
+/// bearer and from nothing else, so a bearer that has been dropped is
+/// never written again.
+fn install_bearer_script(ucm: &UserContentManager, session: &MintedSession) {
     ucm.remove_all_scripts();
-    let script = UserScript::new(
-        &local_storage_inject_script(token),
-        UserContentInjectedFrames::AllFrames,
-        UserScriptInjectionTime::Start,
-        &[],
-        &[],
-    );
-    ucm.add_script(&script);
+    let script = {
+        let mut held = BEARER.lock().unwrap_or_else(|p| p.into_inner());
+        held.install(session);
+        held.script()
+    };
+    if let Some(source) = script {
+        ucm.add_script(&UserScript::new(
+            &source,
+            UserContentInjectedFrames::AllFrames,
+            UserScriptInjectionTime::Start,
+            &[],
+            &[],
+        ));
+    }
+}
+
+/// Stop writing the bearer into pages. Run the moment the steward
+/// refuses it, before a replacement is minted, so no load in between
+/// is handed the dead one.
+fn drop_bearer_script(ucm: &UserContentManager) {
+    ucm.remove_all_scripts();
+}
+
+/// `host`, `port` of a plain-http kiosk URL: where the steward answers
+/// the bearer probe. An https URL is left to the daily renewal.
+fn probe_target(url: &str) -> Option<(String, u16)> {
+    let parsed = url::Url::parse(url).ok()?;
+    if parsed.scheme() != "http" {
+        return None;
+    }
+    Some((
+        parsed.host_str()?.to_string(),
+        parsed.port_or_known_default()?,
+    ))
+}
+
+/// Watch the bearer. Every few seconds the steward is asked whether it
+/// still honours the bearer held. A refusal drops it and mints a fresh
+/// one on the local socket, loaded without a unit restart; an outage
+/// changes nothing, since a down steward says nothing about the bearer.
+fn start_bearer_watch(webview: &WebView, ucm: &UserContentManager, url: &str, reason: &str) {
+    let Some((host, port)) = probe_target(url) else {
+        log_line("bearer watch off: kiosk url is not plain http");
+        return;
+    };
+    let webview = webview.clone();
+    let ucm = ucm.clone();
+    let url = url.to_string();
+    let reason = reason.to_string();
+    let busy = Rc::new(std::cell::Cell::new(false));
+    glib::timeout_add_seconds_local(BEARER_WATCH_SECS, move || {
+        if busy.replace(true) {
+            return ControlFlow::Continue;
+        }
+        let held = BEARER
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .token()
+            .map(str::to_string);
+        let (webview, ucm, url, reason, host, busy) = (
+            webview.clone(),
+            ucm.clone(),
+            url.clone(),
+            reason.clone(),
+            host.clone(),
+            busy.clone(),
+        );
+        glib::spawn_future_local(async move {
+            let state = match held {
+                Some(token) => gio::spawn_blocking(move || probe_bearer(&host, port, &token))
+                    .await
+                    .unwrap_or(BearerState::Unknown),
+                None => BearerState::Unknown,
+            };
+            let (action, dead_id) = {
+                let mut held = BEARER.lock().unwrap_or_else(|p| p.into_inner());
+                let id = held.token_id().map(str::to_string);
+                (held.on_probe(state), id)
+            };
+            if action == WatchAction::Remint {
+                match dead_id {
+                    Some(id) if state == BearerState::Refused => {
+                        log_line(&format!(
+                            "bearer refused by the steward (token_id={id}); reminting"
+                        ));
+                    }
+                    _ => log_line("no bearer held; reminting"),
+                }
+                drop_bearer_script(&ucm);
+                match mint_session(&reason) {
+                    Ok(next) => {
+                        log_line(&format!("bearer remint ok token_id={}", next.token_id));
+                        install_bearer_script(&ucm, &next);
+                        webview.load_uri(&url);
+                        schedule_renew(&webview, &ucm, &url, &next, &reason);
+                    }
+                    Err(e) => log_line(&format!("bearer remint failed: {e}; retrying")),
+                }
+            }
+            busy.set(false);
+        });
+        ControlFlow::Continue
+    });
 }
 
 fn mint_failure_html(detail: &str) -> String {
@@ -262,6 +370,9 @@ fn schedule_renew(
     session: &MintedSession,
     reason: &str,
 ) {
+    // One renewal timer at a time: a remint from any path supersedes the
+    // one before it, so timers do not pile up.
+    let epoch = RENEW_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
     let renew_at = renew_at_ms(session.expires_at_ms, now_ms());
     let delay_ms = renew_at.saturating_sub(now_ms()).max(1_000);
     log_line(&format!(
@@ -275,10 +386,13 @@ fn schedule_renew(
     let url = url.to_string();
     let reason = reason.to_string();
     glib::timeout_add_local(Duration::from_millis(delay_ms), move || {
+        if RENEW_EPOCH.load(Ordering::SeqCst) != epoch {
+            return ControlFlow::Break;
+        }
         match mint_session(&reason) {
             Ok(next) => {
                 log_line(&format!("silent remint ok token_id={}", next.token_id));
-                install_bearer_script(&ucm, &next.token);
+                install_bearer_script(&ucm, &next);
                 // Re-inject on next navigation; also run immediately for the live page.
                 let js = local_storage_inject_script(&next.token);
                 webview.evaluate_javascript(&js, None, None, None::<&gio::Cancellable>, |_| {});
@@ -291,9 +405,12 @@ fn schedule_renew(
                 let url = url.clone();
                 let reason = reason.clone();
                 glib::timeout_add_local(Duration::from_secs(30), move || {
+                    if RENEW_EPOCH.load(Ordering::SeqCst) != epoch {
+                        return ControlFlow::Break;
+                    }
                     match mint_session(&reason) {
                         Ok(next) => {
-                            install_bearer_script(&ucm, &next.token);
+                            install_bearer_script(&ucm, &next);
                             webview.load_uri(&url);
                             schedule_renew(&webview, &ucm, &url, &next, &reason);
                         }
@@ -346,7 +463,7 @@ fn build_ui(app: &Application, url: &str, zoom: f64, reason: &str) {
                 "mint ok token_id={} expires_at_ms={}",
                 session.token_id, session.expires_at_ms
             ));
-            install_bearer_script(&ucm, &session.token);
+            install_bearer_script(&ucm, &session);
             schedule_renew(&webview, &ucm, url, &session, reason);
             webview.load_uri(url);
         }
@@ -355,6 +472,8 @@ fn build_ui(app: &Application, url: &str, zoom: f64, reason: &str) {
             webview.load_html(&mint_failure_html(&e), None);
         }
     };
+
+    start_bearer_watch(&webview, &ucm, url, reason);
 
     // Navigation policy: allow the operator-supplied kiosk URL's
     // origin (scheme + host + port) plus the internally-generated
@@ -421,7 +540,7 @@ fn build_ui(app: &Application, url: &str, zoom: f64, reason: &str) {
         glib::timeout_add_local(Duration::from_millis(RELOAD_DELAY_MS), move || {
             match mint_session(&reason) {
                 Ok(session) => {
-                    install_bearer_script(&ucm, &session.token);
+                    install_bearer_script(&ucm, &session);
                     webview.load_uri(&url);
                     schedule_renew(&webview, &ucm, &url, &session, &reason);
                 }
